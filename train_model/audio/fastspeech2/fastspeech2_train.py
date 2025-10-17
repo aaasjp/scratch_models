@@ -3,7 +3,7 @@ FastSpeech2 完整训练脚本
 使用 HuggingFace LJSpeech 数据集
 
 运行方式:
-python train_fastspeech2_complete.py --epochs 100 --batch_size 16
+python fastspeech2_train.py --epochs 100 --batch_size 16
 """
 
 import torch
@@ -16,8 +16,8 @@ from tqdm import tqdm
 import json
 
 # 导入自定义模块
-from fastspeech2_improved import FastSpeech2, get_mask_from_lengths
-from fastspeech2_real_data import LJSpeechDataset, collate_fn
+from fastspeech2 import FastSpeech2, get_mask_from_lengths
+from fastspeech2_dataset import LJSpeechDataset, collate_fn
 
 
 class FastSpeech2Loss(nn.Module):
@@ -56,7 +56,9 @@ class FastSpeech2Loss(nn.Module):
         energy_loss = energy_loss_masked.sum() / (text_mask.sum() + 1e-6)
         
         # 总损失
-        total_loss = mel_loss + duration_loss + pitch_loss + energy_loss
+        # total_loss = mel_loss + duration_loss + pitch_loss + energy_loss
+        total_loss = 100.0 * mel_loss + 1.0 * duration_loss + 0.1 * pitch_loss + 1.0 * energy_loss
+
         
         return {
             'total_loss': total_loss,
@@ -92,8 +94,7 @@ class Trainer:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5,
-            verbose=True
+            patience=5
         )
         
         # 记录
@@ -342,9 +343,9 @@ def main():
                         help='Dropout 率')
     
     # 训练参数
-    parser.add_argument('--num_epochs', type=int, default=100,
+    parser.add_argument('--num_epochs', type=int, default=30,
                         help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='批大小')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='学习率')
@@ -373,7 +374,7 @@ def main():
         torch.cuda.manual_seed_all(config.seed)
     
     # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
     print(f'使用设备: {device}')
     
     # 加载数据集

@@ -550,7 +550,7 @@ if __name__ == "__main__":
         )
         # 慢速（1.2x）
         _, _, _, _, _, mel_lens_slow = model(
-            text=text, text_lengths=text_lengths, duration_control=1.2
+            text=text, text_lengths=text_lengths, duration_control=1.5
         )
     
     print(f"正常语速: {mel_lengths_inf[0].item()} 帧")

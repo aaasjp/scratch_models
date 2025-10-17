@@ -16,6 +16,7 @@ from phonemizer import phonemize
 from phonemizer.backend import EspeakBackend
 import json
 import pickle
+import subprocess
 
 
 class PhonemeTokenizer:
@@ -112,21 +113,51 @@ class AudioProcessor:
         return mel_db.T  # [T, n_mels]
     
     def get_pitch(self, audio):
-        """提取pitch (使用librosa的pyin算法)"""
-        # pyin 算法
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            audio,
-            fmin=librosa.note_to_hz('C2'),  # ~65 Hz
-            fmax=librosa.note_to_hz('C7'),  # ~2093 Hz
-            sr=self.sample_rate,
-            frame_length=self.win_length,
-            hop_length=self.hop_length
-        )
-        
-        # 处理未发声部分（用0填充）
-        f0 = np.where(np.isnan(f0), 0.0, f0)
-        
-        return f0
+        """提取pitch (使用更快的算法)"""
+        try:
+            # 方法1: 使用 librosa.yin (比 pyin 快很多)
+            f0 = librosa.yin(
+                audio,
+                fmin=librosa.note_to_hz('C2'),  # ~65 Hz
+                fmax=librosa.note_to_hz('C7'),  # ~2093 Hz
+                sr=self.sample_rate,
+                frame_length=self.win_length,
+                hop_length=self.hop_length
+            )
+            
+            # 处理未发声部分（用0填充）
+            f0 = np.where(np.isnan(f0), 0.0, f0)
+            
+            return f0
+        except Exception as e:
+            print(f"YIN pitch 提取失败: {e}")
+            # 备选方案：使用简单的自相关方法
+            try:
+                # 简化的 pitch 估计
+                frame_length = self.win_length
+                hop_length = self.hop_length
+                n_frames = 1 + (len(audio) - frame_length) // hop_length
+                f0 = np.zeros(n_frames)
+                
+                for i in range(n_frames):
+                    start = i * hop_length
+                    end = start + frame_length
+                    if end <= len(audio):
+                        frame = audio[start:end]
+                        # 简单的 pitch 估计（基于零交叉率）
+                        zcr = librosa.feature.zero_crossing_rate(frame.reshape(1, -1))[0, 0]
+                        # 粗略的 pitch 估计
+                        if zcr < 0.1:  # 低频信号
+                            f0[i] = 200.0  # 默认 pitch
+                        else:
+                            f0[i] = 0.0  # 无声
+                
+                return f0
+            except Exception as e2:
+                print(f"备选 pitch 提取也失败: {e2}")
+                # 最后的备选：返回固定值
+                n_frames = 1 + (len(audio) - self.win_length) // self.hop_length
+                return np.full(n_frames, 200.0)  # 默认 pitch
     
     def get_energy(self, audio):
         """提取能量"""
@@ -181,19 +212,23 @@ class LJSpeechDataset(Dataset):
             print(f"预处理 {split} 数据...")
             # 加载 LJSpeech 数据集
             print("从 HuggingFace 下载 LJSpeech 数据集...")
-            dataset = load_dataset("lj_speech", cache_dir=cache_dir, trust_remote_code=True)
+            dataset = load_dataset("MikhailT/lj-speech", cache_dir=cache_dir)
             
             # LJSpeech 没有官方的 train/val split，我们手动分割
-            # 使用最后的 100 个样本作为验证集
+            # 使用90%作为训练集，10%作为验证集
+            total_size = len(dataset['full'])
+            train_size = int(total_size * 0.9)
+            
             if split == 'train':
-                raw_data = dataset['train'].select(range(len(dataset['train']) - 100))
+                raw_data = dataset['full'].select(range(train_size))
             else:  # validation
-                raw_data = dataset['train'].select(range(len(dataset['train']) - 100, len(dataset['train'])))
+                raw_data = dataset['full'].select(range(train_size, total_size))
             
             if max_samples:
                 raw_data = raw_data.select(range(min(max_samples, len(raw_data))))
             
             print(f"数据集大小: {len(raw_data)}")
+            print(f"数据样本[0]: {raw_data[0]}")
             
             # 初始化或加载 tokenizer
             if os.path.exists(tokenizer_path) and split == 'validation':
@@ -233,10 +268,10 @@ class LJSpeechDataset(Dataset):
                     'pitch_max': float(np.max(pitch_values)) if pitch_values else 800.0,
                     'pitch_mean': float(np.mean(pitch_values)) if pitch_values else 200.0,
                     'pitch_std': float(np.std(pitch_values)) if pitch_values else 50.0,
-                    'energy_min': float(np.min(energy_values)),
-                    'energy_max': float(np.max(energy_values)),
-                    'energy_mean': float(np.mean(energy_values)),
-                    'energy_std': float(np.std(energy_values))
+                    'energy_min': float(np.min(energy_values)) if energy_values else 0.0,
+                    'energy_max': float(np.max(energy_values)) if energy_values else 1.0,
+                    'energy_mean': float(np.mean(energy_values)) if energy_values else 0.5,
+                    'energy_std': float(np.std(energy_values)) if energy_values else 0.1
                 }
                 
                 with open(stats_path, 'w') as f:
@@ -261,23 +296,51 @@ class LJSpeechDataset(Dataset):
             # 清理文本
             text = text.lower().strip()
             
-            # 转换为音素
-            phonemes = phonemize(
-                text,
-                language='en-us',
-                backend='espeak',
-                strip=True,
-                preserve_punctuation=False,
-                with_stress=False
-            )
+            '''
+            # 方法1: 使用 phonemizer (指定 espeak 路径)
+            try:
+                phonemes = phonemize(
+                    text,
+                    language='en-us',
+                    backend='espeak',
+                    strip=True,
+                    preserve_punctuation=False,
+                    with_stress=False,
+                    separator=' ',
+                    njobs=1
+                )
+                phoneme_list = phonemes.split()
+                if phoneme_list:
+                    return phoneme_list
+            except Exception as e1:
+                print(f"phonemizer 失败: {e1}")
             
-            # 分割音素（espeak 使用空格分隔）
-            phoneme_list = phonemes.split()
+            '''
+            # 方法2: 直接调用 espeak
+            try:
+                result = subprocess.run(
+                    ['/opt/homebrew/bin/espeak', '-q', '--ipa', '-v', 'en-us', text],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    phonemes = result.stdout.strip()
+                    print(f"phonemes: {phonemes}")
+                    # 简单的音素分割（移除 IPA 符号）
+                    phoneme_list = [p for p in phonemes if p.isalpha() or p in 'ɪəʊʌɑːæeɪaɪɔɪəʊaʊɪəeəʊə']
+                    if phoneme_list:
+                        return phoneme_list
+            except Exception as e2:
+                print(f"espeak 直接调用失败: {e2}")
             
-            return phoneme_list
+            # 方法3: 字符级分割作为备选
+            print("使用字符级分割作为备选...")
+            return list(text.replace(' ', '_'))
+            
         except Exception as e:
-            print(f"音素转换失败: {e}")
-            return []
+            print(f"音素转换完全失败: {e}")
+            return list(text.replace(' ', '_'))
     
     def _estimate_duration(self, phonemes, mel_len):
         """
@@ -352,7 +415,7 @@ class LJSpeechDataset(Dataset):
         audio = raw_sample['audio']['array']
         sr = raw_sample['audio']['sampling_rate']
         text = raw_sample['normalized_text']
-        
+
         # 重采样到22050Hz
         if sr != self.audio_processor.sample_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.audio_processor.sample_rate)
@@ -490,7 +553,7 @@ if __name__ == "__main__":
         split='train',
         cache_dir='./cache',
         processed_dir='./processed_data',
-        max_samples=100,  # 快速测试，使用100个样本；实际训练时设为None
+        #max_samples=10,  # 快速测试，使用100个样本；实际训练时设为None
         force_preprocess=False
     )
     
@@ -502,7 +565,7 @@ if __name__ == "__main__":
         split='validation',
         cache_dir='./cache',
         processed_dir='./processed_data',
-        max_samples=20,  # 快速测试；实际训练时设为None
+        #max_samples=2,  # 快速测试；实际训练时设为None
         force_preprocess=False
     )
     
@@ -552,6 +615,6 @@ if __name__ == "__main__":
     print("=" * 70)
     
     print("\n下一步:")
-    print("1. 使用 fastspeech2_improved.py 中的模型")
-    print("2. 使用 fastspeech2_training_improved.py 中的训练代码")
+    print("1. 使用 fastspeech2.py 中的模型")
+    print("2. 使用 fastspeech2_training_.py 中的训练代码")
     print("3. 开始训练!")
