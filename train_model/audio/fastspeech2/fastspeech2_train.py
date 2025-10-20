@@ -20,6 +20,71 @@ from fastspeech2 import FastSpeech2, get_mask_from_lengths
 from fastspeech2_dataset import LJSpeechDataset, collate_fn
 
 
+def load_stats(processed_dir: str):
+    """从 processed_dir 读取 stats.json 统计信息并返回字典。"""
+    stats_path = os.path.join(processed_dir, 'stats.json')
+    if not os.path.exists(stats_path):
+        raise FileNotFoundError(f"未找到统计文件: {stats_path}")
+    with open(stats_path, 'r') as f:
+        return json.load(f)
+
+
+def clamp_and_standardize(x: torch.Tensor,
+                          min_value: float,
+                          max_value: float,
+                          mean_value: float,
+                          std_value: float,
+                          eps: float = 1e-6) -> torch.Tensor:
+    """按[min,max]裁剪后做标准化 (x - mean) / (std + eps)。"""
+    x = torch.clamp(x, min=float(min_value), max=float(max_value))
+    return (x - float(mean_value)) / (float(std_value) + eps)
+
+
+def normalize_targets(mel_target: torch.Tensor,
+                      duration_target: torch.Tensor,
+                      pitch_target: torch.Tensor,
+                      energy_target: torch.Tensor,
+                      processed_dir: str = None,
+                      stats: dict = None,
+                      eps: float = 1e-6):
+    """根据 stats.json 的 mean/min/max/std 对四个 target 执行裁剪+标准化归一化。
+
+    参数:
+        mel_target: [B, T_mel, n_mels] 或 [T_mel, n_mels]
+        duration_target: [B, L_text] 或 [L_text]
+        pitch_target: [B, L_text] 或 [L_text]
+        energy_target: [B, L_text] 或 [L_text]
+        processed_dir: 存放 stats.json 的目录（当 stats 未显式传入时必须提供）
+        stats: 预先加载好的统计字典（可选），键包含 mel/pitch/energy/duration 的 min/max/mean/std
+        eps: 数值稳定项
+
+    返回:
+        (mel_norm, duration_norm, pitch_norm, energy_norm)
+
+    注意:
+        目前训练中 duration 损失使用对数域目标；若改用本函数标准化后的 duration，需同步调整损失计算逻辑。
+    """
+    if stats is None:
+        if processed_dir is None:
+            raise ValueError("normalize_targets 需要提供 processed_dir 或者 stats 字典")
+        stats = load_stats(processed_dir)
+
+    mel_norm = clamp_and_standardize(
+        mel_target, stats['mel_min'], stats['mel_max'], stats['mel_mean'], stats['mel_std'], eps
+    )
+    duration_norm = clamp_and_standardize(
+        duration_target, stats['duration_min'], stats['duration_max'], stats['duration_mean'], stats['duration_std'], eps
+    )
+    pitch_norm = clamp_and_standardize(
+        pitch_target, stats['pitch_min'], stats['pitch_max'], stats['pitch_mean'], stats['pitch_std'], eps
+    )
+    energy_norm = clamp_and_standardize(
+        energy_target, stats['energy_min'], stats['energy_max'], stats['energy_mean'], stats['energy_std'], eps
+    )
+
+    return mel_norm, duration_norm, pitch_norm, energy_norm
+
+
 class FastSpeech2Loss(nn.Module):
     """FastSpeech2 损失函数"""
     def __init__(self):
@@ -31,17 +96,28 @@ class FastSpeech2Loss(nn.Module):
         """
         计算损失，正确处理 mask
         """
+        '''
+        print("============LOSS START============")
+        print(f"predictions: {predictions}")
+        print(f"targets: {targets}")
+        print(f"text_mask: {text_mask}")
+        print(f"mel_mask: {mel_mask}")
+        print("============LOSS END============")
+        '''
+
+
         mel_pred, duration_pred, pitch_pred, energy_pred = predictions
-        mel_target, duration_target, pitch_target, energy_target = targets
+        mel_target, duration_target, pitch_target, energy_target = normalize_targets(
+            targets[0], targets[1], targets[2], targets[3], processed_dir='./processed_data'
+        )
         
         # 1. Mel Loss (MAE)
         mel_loss_unreduced = self.mae_loss(mel_pred, mel_target)
         mel_loss_masked = mel_loss_unreduced * mel_mask.unsqueeze(-1).float()
         mel_loss = mel_loss_masked.sum() / (mel_mask.sum() * mel_pred.size(-1) + 1e-6)
         
-        # 2. Duration Loss (对数域 MSE)
-        duration_target_log = torch.log(duration_target + 1)
-        duration_loss_unreduced = self.mse_loss(duration_pred, duration_target_log)
+        # 2. Duration Loss (MSE)
+        duration_loss_unreduced = self.mse_loss(duration_pred, duration_target)
         duration_loss_masked = duration_loss_unreduced * text_mask.float()
         duration_loss = duration_loss_masked.sum() / (text_mask.sum() + 1e-6)
         
@@ -56,8 +132,7 @@ class FastSpeech2Loss(nn.Module):
         energy_loss = energy_loss_masked.sum() / (text_mask.sum() + 1e-6)
         
         # 总损失
-        # total_loss = mel_loss + duration_loss + pitch_loss + energy_loss
-        total_loss = 100.0 * mel_loss + 1.0 * duration_loss + 0.1 * pitch_loss + 1.0 * energy_loss
+        total_loss = mel_loss + duration_loss + pitch_loss + energy_loss
 
         
         return {
@@ -118,6 +193,18 @@ class Trainer:
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
         for batch_idx, batch in enumerate(pbar):
+            #打印第一个batch的第一条数据的详细信息
+            if batch_idx == 0:
+                print("============BATCH START============")
+                print(f"batch_idx: {batch_idx}")
+                print(f"text: {batch['text'][0]}")
+                print(f"text_lengths: {batch['text_lengths'][0]}")
+                print(f"mel: {batch['mel'][0]}")
+                print(f"mel_lengths: {batch['mel_lengths'][0]}")
+                print(f"duration: {batch['duration'][0]}")
+                print(f"pitch: {batch['pitch'][0]}")
+                print(f"energy: {batch['energy'][0]}")
+                print("============BATCH END============")
             # 数据移到设备
             text = batch['text'].to(self.device)
             text_lengths = batch['text_lengths'].to(self.device)
@@ -166,6 +253,8 @@ class Trainer:
                 'loss': f"{losses['total_loss'].item():.4f}",
                 'mel': f"{losses['mel_loss'].item():.4f}",
                 'dur': f"{losses['duration_loss'].item():.4f}",
+                'pit': f"{losses['pitch_loss'].item():.4f}",
+                'ene': f"{losses['energy_loss'].item():.4f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
             })
         
@@ -320,7 +409,11 @@ def main():
     
     # 数据参数
     parser.add_argument('--cache_dir', type=str, default='./cache',
-                        help='HuggingFace 数据集缓存目录')
+                        help='HuggingFace 数据集缓存目录（当前未使用）')
+    parser.add_argument('--corpus_dir', type=str, default='./corpus',
+                        help='原始语音与标注(.lab)所在目录')
+    parser.add_argument('--aligned_dir', type=str, default='./corpus_aligned',
+                        help='MFA 对齐后的 TextGrid 文件目录')
     parser.add_argument('--processed_dir', type=str, default='./processed_data',
                         help='预处理数据保存目录')
     parser.add_argument('--max_train_samples', type=int, default=None,
@@ -345,7 +438,7 @@ def main():
     # 训练参数
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=1,
                         help='批大小')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='学习率')
@@ -384,19 +477,25 @@ def main():
     
     train_dataset = LJSpeechDataset(
         split='train',
-        cache_dir=config.cache_dir,
+        corpus_dir=config.corpus_dir,
+        aligned_dir=config.aligned_dir,
         processed_dir=config.processed_dir,
         max_samples=config.max_train_samples,
-        force_preprocess=config.force_preprocess
+        force_preprocess=False
     )
     
     val_dataset = LJSpeechDataset(
         split='validation',
-        cache_dir=config.cache_dir,
+        corpus_dir=config.corpus_dir,
+        aligned_dir=config.aligned_dir,
         processed_dir=config.processed_dir,
         max_samples=config.max_val_samples,
         force_preprocess=False
     )
+    
+    # 打印一共多少条训练数据和验证数据
+    print(f"训练数据集大小: {len(train_dataset)}")
+    print(f"验证数据集大小: {len(val_dataset)}")
     
     # 创建 DataLoader
     train_loader = DataLoader(
@@ -430,7 +529,8 @@ def main():
         n_heads=config.n_heads,
         d_ff=config.d_ff,
         dropout=config.dropout,
-        n_mel_channels=80
+        n_mel_channels=80,
+        stats_path=config.processed_dir+'/stats.json'
     )
     
     total_params = sum(p.numel() for p in model.parameters())

@@ -1,7 +1,10 @@
+from tkinter import E
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import json
+import os
 
 
 def get_mask_from_lengths(lengths, max_len=None):
@@ -227,7 +230,7 @@ class LengthRegulator(nn.Module):
 
 class VarianceAdaptor(nn.Module):
     """方差适配器（改进版）"""
-    def __init__(self, d_model, kernel_size=3, dropout=0.5, n_bins=256):
+    def __init__(self, d_model, kernel_size=3, dropout=0.5, n_bins=256, stats_path=None):
         super().__init__()
         self.duration_predictor = VariancePredictor(d_model, kernel_size, dropout)
         self.length_regulator = LengthRegulator()
@@ -239,11 +242,44 @@ class VarianceAdaptor(nn.Module):
         
         self.n_bins = n_bins
         
-        # Pitch 和 Energy 的统计值（需要从数据集计算）
-        self.register_buffer('pitch_min', torch.tensor(0.0))
-        self.register_buffer('pitch_max', torch.tensor(800.0))
-        self.register_buffer('energy_min', torch.tensor(0.0))
-        self.register_buffer('energy_max', torch.tensor(100.0))
+        # 从stats.json加载统计值，如果文件不存在则使用默认值
+        self._load_stats_from_json(stats_path)
+    
+    def _load_stats_from_json(self, stats_path):
+        """从stats.json文件加载统计值"""
+        if stats_path and os.path.exists(stats_path):
+            try:
+                with open(stats_path, 'r') as f:
+                    stats = json.load(f)
+                
+                # 加载pitch统计值
+                self.register_buffer('pitch_min', torch.tensor(stats.get('pitch_min', 0.0)))
+                self.register_buffer('pitch_max', torch.tensor(stats.get('pitch_max', 800.0)))
+                self.register_buffer('pitch_mean', torch.tensor(stats.get('pitch_mean', 0.0)))
+                self.register_buffer('pitch_std', torch.tensor(stats.get('pitch_std', 1.0)))
+                
+                # 加载energy统计值
+                self.register_buffer('energy_min', torch.tensor(stats.get('energy_min', 0.0)))
+                self.register_buffer('energy_max', torch.tensor(stats.get('energy_max', 100.0)))
+                self.register_buffer('energy_mean', torch.tensor(stats.get('energy_mean', 0.0)))
+                self.register_buffer('energy_std', torch.tensor(stats.get('energy_std', 1.0)))
+                
+                # 加载duration统计值
+                self.register_buffer('duration_min', torch.tensor(stats.get('duration_min', 1.0)))
+                self.register_buffer('duration_max', torch.tensor(stats.get('duration_max', 100.0)))
+                self.register_buffer('duration_mean', torch.tensor(stats.get('duration_mean', 8.0)))
+                self.register_buffer('duration_std', torch.tensor(stats.get('duration_std', 5.0)))
+                
+                print(f"成功从 {stats_path} 加载统计值")
+                
+            except Exception as e:
+                print(f"加载统计值失败: {e}，使用默认值")
+                self._register_default_stats()
+        else:
+            print("失败：未找到stats.json文件")
+            raise Exception(f"失败：未找到stats.json文件: {e}") from e
+    
+    
         
     def get_pitch_embedding(self, pitch, mask=None):
         """将连续pitch值转换为embedding"""
@@ -269,7 +305,7 @@ class VarianceAdaptor(nn.Module):
         return energy_emb
         
     def forward(self, x, text_mask=None, duration=None, pitch=None, energy=None, 
-                max_len=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0):
+                max_len=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0,eps=1e-6):
         """
         Args:
             x: [batch, text_len, d_model]
@@ -289,14 +325,27 @@ class VarianceAdaptor(nn.Module):
         
         # 训练时使用真实值，推理时使用预测值
         if duration is None:
-            # 推理模式：从对数域转换并应用控制系数
-            duration = torch.round(torch.exp(duration_pred) - 1).clamp(min=0) * duration_control
+            # 归一化的逆运算，先进行log计算，再进行归一化
+            duration = duration_pred * (float(self.duration_std) + eps) + float(self.duration_mean)
+            # 应用duration_control控制
+            duration = duration * duration_control
+            # 确保duration为正值且为整数
+            duration = torch.clamp(duration, min=float(self.duration_min), max=float(self.duration_max))
+            duration = torch.round(duration)
         
         if pitch is None:
-            pitch = pitch_pred * pitch_control
+            # 归一化的逆运算，先进行log计算，再进行归一化
+            pitch = pitch_pred * (float(self.pitch_std) + eps) + float(self.pitch_mean)
+            # 应用pitch_control控制
+            pitch = pitch * pitch_control
+            pitch = torch.clamp(pitch, min=float(self.pitch_min), max=float(self.pitch_max))
         
         if energy is None:
-            energy = energy_pred * energy_control
+            # 归一化的逆运算，先进行log计算，再进行归一化
+            energy = energy_pred * (float(self.energy_std) + eps) + float(self.energy_mean)
+            # 应用energy_control控制
+            energy = energy * energy_control
+            energy = torch.clamp(energy, min=float(self.energy_min), max=float(self.energy_max))
             
         # 添加 pitch 和 energy embedding
         pitch_emb = self.get_pitch_embedding(pitch, text_mask)
@@ -324,7 +373,8 @@ class FastSpeech2(nn.Module):
         d_ff=1024,
         dropout=0.1,
         n_mel_channels=80,
-        max_seq_len=1000
+        max_seq_len=1000,
+        stats_path=None
     ):
         super().__init__()
         
@@ -341,7 +391,7 @@ class FastSpeech2(nn.Module):
         ])
         
         # 方差适配器
-        self.variance_adaptor = VarianceAdaptor(d_model, dropout=dropout)
+        self.variance_adaptor = VarianceAdaptor(d_model, dropout=dropout, stats_path=stats_path)
         
         # 解码器
         self.decoder = nn.ModuleList([

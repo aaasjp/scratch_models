@@ -17,7 +17,11 @@ from phonemizer.backend import EspeakBackend
 import json
 import pickle
 import subprocess
-
+from typing import Optional, List
+import re
+import tempfile
+import shutil
+from pathlib import Path
 
 class PhonemeTokenizer:
     """音素分词器"""
@@ -112,53 +116,36 @@ class AudioProcessor:
         
         return mel_db.T  # [T, n_mels]
     
-    def get_pitch(self, audio):
-        """提取pitch (使用更快的算法)"""
+    def get_pitch(self, audio: np.ndarray) -> np.ndarray:
+        """
+        使用 librosa.yin 提取基频 (F0)。
+        
+        Returns:
+            np.ndarray: F0 轨迹，未发声部分设为 0.0。
+        """
+        if audio.size == 0:
+            raise Exception("失败：Input audio is empty.")
+
+        # 安全设置 fmin/fmax
+        fmin = librosa.note_to_hz('C2')  # ~65.4 Hz
+        fmax = librosa.note_to_hz('C7')  # ~2093 Hz
+
         try:
-            # 方法1: 使用 librosa.yin (比 pyin 快很多)
             f0 = librosa.yin(
-                audio,
-                fmin=librosa.note_to_hz('C2'),  # ~65 Hz
-                fmax=librosa.note_to_hz('C7'),  # ~2093 Hz
+                y=audio,
+                fmin=fmin,
+                fmax=fmax,
                 sr=self.sample_rate,
                 frame_length=self.win_length,
-                hop_length=self.hop_length
+                hop_length=self.hop_length,
             )
-            
-            # 处理未发声部分（用0填充）
-            f0 = np.where(np.isnan(f0), 0.0, f0)
-            
-            return f0
         except Exception as e:
-            print(f"YIN pitch 提取失败: {e}")
-            # 备选方案：使用简单的自相关方法
-            try:
-                # 简化的 pitch 估计
-                frame_length = self.win_length
-                hop_length = self.hop_length
-                n_frames = 1 + (len(audio) - frame_length) // hop_length
-                f0 = np.zeros(n_frames)
-                
-                for i in range(n_frames):
-                    start = i * hop_length
-                    end = start + frame_length
-                    if end <= len(audio):
-                        frame = audio[start:end]
-                        # 简单的 pitch 估计（基于零交叉率）
-                        zcr = librosa.feature.zero_crossing_rate(frame.reshape(1, -1))[0, 0]
-                        # 粗略的 pitch 估计
-                        if zcr < 0.1:  # 低频信号
-                            f0[i] = 200.0  # 默认 pitch
-                        else:
-                            f0[i] = 0.0  # 无声
-                
-                return f0
-            except Exception as e2:
-                print(f"备选 pitch 提取也失败: {e2}")
-                # 最后的备选：返回固定值
-                n_frames = 1 + (len(audio) - self.win_length) // self.hop_length
-                return np.full(n_frames, 200.0)  # 默认 pitch
-    
+            raise Exception(f"失败：YIN pitch extraction failed: {e}") from e
+
+        # YIN 不返回 NaN，但会返回超出 [fmin, fmax] 的值表示无效，所以将不可靠的 F0 设为 0.0
+        f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
+        return f0
+    '''
     def get_energy(self, audio):
         """提取能量"""
         # 使用RMS能量
@@ -169,28 +156,50 @@ class AudioProcessor:
         )[0]
         
         return energy
+    '''
 
+    def get_energy(self, audio):
+        """提取能量（使用平方和，确保与mel频谱长度一致）"""
+        # 使用STFT计算能量，确保与mel频谱长度一致
+        # 先计算STFT
+        stft = librosa.stft(
+            y=audio,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length
+        )
+        
+        # 计算每帧的平方和作为能量
+        energy = np.sum(np.abs(stft) ** 2, axis=0)
+        
+        return energy
 
 class LJSpeechDataset(Dataset):
-    """LJSpeech 数据集（从 HuggingFace 加载）"""
+    """LJSpeech 数据集（从本地已对齐数据加载）"""
     def __init__(self, 
                  split='train',
-                 cache_dir='./cache',
+                 corpus_dir='./corpus',
+                 aligned_dir='./corpus_aligned',
                  processed_dir='./processed_data',
                  max_samples=None,
                  force_preprocess=False):
         """
         Args:
             split: 'train' 或 'validation'
-            cache_dir: HuggingFace数据集缓存目录
+            corpus_dir: 原始音频和文本文件目录
+            aligned_dir: MFA对齐后的TextGrid文件目录
             processed_dir: 预处理后的数据保存目录
             max_samples: 最大样本数（用于快速测试）
             force_preprocess: 是否强制重新预处理
         """
         self.split = split
-        self.cache_dir = cache_dir
+        self.corpus_dir = corpus_dir
+        self.aligned_dir = aligned_dir
         self.processed_dir = processed_dir
         os.makedirs(processed_dir, exist_ok=True)
+        print(f"corpus_dir: {corpus_dir}")
+        print(f"aligned_dir: {aligned_dir}")
+        print(f"processed_dir: {processed_dir}")
         
         # 初始化音频处理器
         self.audio_processor = AudioProcessor()
@@ -210,45 +219,63 @@ class LJSpeechDataset(Dataset):
             print(f"✓ 加载了 {len(self.samples)} 个样本")
         else:
             print(f"预处理 {split} 数据...")
-            # 加载 LJSpeech 数据集
-            print("从 HuggingFace 下载 LJSpeech 数据集...")
-            dataset = load_dataset("MikhailT/lj-speech", cache_dir=cache_dir)
+            # 获取所有可用的文件
+            self.file_list = self._get_file_list()
             
-            # LJSpeech 没有官方的 train/val split，我们手动分割
-            # 使用90%作为训练集，10%作为验证集
-            total_size = len(dataset['full'])
+            # 分割训练集和验证集
+            total_size = len(self.file_list)
             train_size = int(total_size * 0.9)
             
             if split == 'train':
-                raw_data = dataset['full'].select(range(train_size))
+                self.file_list = self.file_list[:train_size]
             else:  # validation
-                raw_data = dataset['full'].select(range(train_size, total_size))
+                self.file_list = self.file_list[train_size:]
             
             if max_samples:
-                raw_data = raw_data.select(range(min(max_samples, len(raw_data))))
+                self.file_list = self.file_list[:min(max_samples, len(self.file_list))]
             
-            print(f"数据集大小: {len(raw_data)}")
-            print(f"数据样本[0]: {raw_data[0]}")
+            print(f"数据集大小: {len(self.file_list)}")
             
             # 初始化或加载 tokenizer
             if os.path.exists(tokenizer_path) and split == 'validation':
                 self.tokenizer = PhonemeTokenizer.load(tokenizer_path)
             else:
                 self.tokenizer = PhonemeTokenizer()
+                
+                # 如果是训练集，从所有TextGrid文件构建音素词表
+                if split == 'train':
+                    print("从所有TextGrid文件构建音素词表...")
+                    all_phonemes = set()
+                    
+                    # 获取所有可用的文件（不仅仅是当前分割）
+                    all_files = self._get_file_list()
+                    for file_info in tqdm(all_files, desc="Building phoneme vocabulary"):
+                        phonemes = self._extract_phonemes_from_textgrid(file_info['textgrid_path'])
+                        all_phonemes.update(phonemes)
+                    
+                    # 添加所有音素到tokenizer
+                    for phoneme in sorted(all_phonemes):
+                        self.tokenizer.add_token(phoneme)
+                    
+                    print(f"✓ 构建了包含 {len(all_phonemes)} 个音素的词表")
             
             # 预处理所有样本
             self.samples = []
             pitch_values = []
             energy_values = []
+            duration_values = []
+            mel_values = []
             
             print("开始预处理样本...")
-            for idx in tqdm(range(len(raw_data)), desc=f"Processing {split}"):
+            for idx in tqdm(range(len(self.file_list)), desc=f"Processing {split}"):
                 try:
-                    sample = self._preprocess_sample(raw_data[idx])
+                    sample = self._preprocess_sample(idx)
                     if sample is not None:
                         self.samples.append(sample)
                         pitch_values.extend(sample['pitch'].tolist())
                         energy_values.extend(sample['energy'].tolist())
+                        duration_values.extend(sample['duration'].tolist())
+                        mel_values.extend(sample['mel'].flatten().tolist())
                 except Exception as e:
                     print(f"\n警告: 样本 {idx} 处理失败: {e}")
                     continue
@@ -264,14 +291,22 @@ class LJSpeechDataset(Dataset):
                 # 计算统计信息
                 pitch_values = [p for p in pitch_values if p > 0]  # 只考虑有声部分
                 self.stats = {
-                    'pitch_min': float(np.min(pitch_values)) if pitch_values else 0.0,
-                    'pitch_max': float(np.max(pitch_values)) if pitch_values else 800.0,
-                    'pitch_mean': float(np.mean(pitch_values)) if pitch_values else 200.0,
-                    'pitch_std': float(np.std(pitch_values)) if pitch_values else 50.0,
-                    'energy_min': float(np.min(energy_values)) if energy_values else 0.0,
-                    'energy_max': float(np.max(energy_values)) if energy_values else 1.0,
-                    'energy_mean': float(np.mean(energy_values)) if energy_values else 0.5,
-                    'energy_std': float(np.std(energy_values)) if energy_values else 0.1
+                    'pitch_min': float(np.min(pitch_values)),
+                    'pitch_max': float(np.max(pitch_values)),
+                    'pitch_mean': float(np.mean(pitch_values)),
+                    'pitch_std': float(np.std(pitch_values)),
+                    'energy_min': float(np.min(energy_values)),
+                    'energy_max': float(np.max(energy_values)),
+                    'energy_mean': float(np.mean(energy_values)),
+                    'energy_std': float(np.std(energy_values)),
+                    'duration_min': float(np.min(duration_values)),
+                    'duration_max': float(np.max(duration_values)),
+                    'duration_mean': float(np.mean(duration_values)),
+                    'duration_std': float(np.std(duration_values)),
+                    'mel_min': float(np.min(mel_values)),
+                    'mel_max': float(np.max(mel_values)),
+                    'mel_mean': float(np.mean(mel_values)),
+                    'mel_std': float(np.std(mel_values))
                 }
                 
                 with open(stats_path, 'w') as f:
@@ -279,6 +314,8 @@ class LJSpeechDataset(Dataset):
                 print(f"✓ 统计信息已保存: {stats_path}")
                 print(f"  Pitch range: [{self.stats['pitch_min']:.1f}, {self.stats['pitch_max']:.1f}]")
                 print(f"  Energy range: [{self.stats['energy_min']:.4f}, {self.stats['energy_max']:.4f}]")
+                print(f"  Duration range: [{self.stats['duration_min']:.4f}, {self.stats['duration_max']:.4f}]")
+                print(f"  Mel range: [{self.stats['mel_min']:.4f}, {self.stats['mel_max']:.4f}]")
             else:
                 # 验证集使用训练集的统计信息
                 with open(stats_path, 'r') as f:
@@ -289,82 +326,191 @@ class LJSpeechDataset(Dataset):
                 pickle.dump(self.samples, f)
             print(f"✓ 预处理数据已保存: {samples_path}")
     
-    def _text_to_phonemes(self, text):
-        """将文本转换为音素"""
-        # 使用 espeak 后端进行 G2P
+    def _get_file_list(self):
+        """获取所有可用的文件列表"""
+        wav_files = []
+        for file in os.listdir(self.corpus_dir):
+            if file.endswith('.wav'):
+                base_name = file[:-4]  # 去掉.wav扩展名
+                wav_path = os.path.join(self.corpus_dir, file)
+                lab_path = os.path.join(self.corpus_dir, base_name + '.lab')
+                textgrid_path = os.path.join(self.aligned_dir, base_name + '.TextGrid')
+                
+                # 检查所有必需的文件是否存在
+                if os.path.exists(lab_path) and os.path.exists(textgrid_path):
+                    wav_files.append({
+                        'wav_path': wav_path,
+                        'lab_path': lab_path,
+                        'textgrid_path': textgrid_path,
+                        'base_name': base_name
+                    })
+        
+        # 按文件名排序
+        wav_files.sort(key=lambda x: x['base_name'])
+        return wav_files
+    
+    def _read_textgrid_durations(self, textgrid_path: str) -> Optional[np.ndarray]:
+        """
+        从TextGrid文件读取MFA对齐结果，返回每个音素的duration（帧数）
+        
+        Args:
+            textgrid_path: TextGrid文件路径
+            
+        Returns:
+            durations: 每个音素的duration（帧数），如果读取失败返回None
+        """
         try:
-            # 清理文本
-            text = text.lower().strip()
+            import textgrid
+            tg = textgrid.TextGrid.fromFile(textgrid_path)
             
-            '''
-            # 方法1: 使用 phonemizer (指定 espeak 路径)
-            try:
-                phonemes = phonemize(
-                    text,
-                    language='en-us',
-                    backend='espeak',
-                    strip=True,
-                    preserve_punctuation=False,
-                    with_stress=False,
-                    separator=' ',
-                    njobs=1
-                )
-                phoneme_list = phonemes.split()
-                if phoneme_list:
-                    return phoneme_list
-            except Exception as e1:
-                print(f"phonemizer 失败: {e1}")
+            # 查找phones层
+            phoneme_tier = None
+            for tier in tg.tiers:
+                if tier.name == 'phones':
+                    phoneme_tier = tier
+                    break
             
-            '''
-            # 方法2: 直接调用 espeak
-            try:
-                result = subprocess.run(
-                    ['/opt/homebrew/bin/espeak', '-q', '--ipa', '-v', 'en-us', text],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    phonemes = result.stdout.strip()
-                    print(f"phonemes: {phonemes}")
-                    # 简单的音素分割（移除 IPA 符号）
-                    phoneme_list = [p for p in phonemes if p.isalpha() or p in 'ɪəʊʌɑːæeɪaɪɔɪəʊaʊɪəeəʊə']
-                    if phoneme_list:
-                        return phoneme_list
-            except Exception as e2:
-                print(f"espeak 直接调用失败: {e2}")
+            if phoneme_tier is None:
+                print(f"警告: 未找到phones层 in {textgrid_path}")
+                return None
             
-            # 方法3: 字符级分割作为备选
-            print("使用字符级分割作为备选...")
-            return list(text.replace(' ', '_'))
+            # 计算每个音素的duration（帧数）
+            durations = []
+            for interval in phoneme_tier:
+                if interval.mark.strip():  # 跳过空音素
+                    # 将时间转换为帧数
+                    duration_frames = int(interval.maxTime * self.audio_processor.sample_rate / self.audio_processor.hop_length) - \
+                                   int(interval.minTime * self.audio_processor.sample_rate / self.audio_processor.hop_length)
+                    durations.append(max(1, duration_frames))  # 确保至少1帧
+            
+            return np.array(durations, dtype=np.float32)
             
         except Exception as e:
-            print(f"音素转换完全失败: {e}")
-            return list(text.replace(' ', '_'))
+            print(f"读取TextGrid文件失败 {textgrid_path}: {e}")
+            return None
     
-    def _estimate_duration(self, phonemes, mel_len):
+    def _read_lab_text(self, lab_path: str) -> str:
+        """从.lab文件读取文本"""
+        try:
+            with open(lab_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"读取lab文件失败 {lab_path}: {e}")
+            return ""
+    
+    def _extract_phonemes_from_textgrid(self, textgrid_path: str) -> List[str]:
         """
-        估计每个音素的 duration
+        从TextGrid文件中提取音素序列
         
-        注意: 这是一个简化的估计方法
-        实际项目中应该使用 Montreal Forced Aligner 进行精确对齐
+        Args:
+            textgrid_path: TextGrid文件路径
+            
+        Returns:
+            phonemes: 音素列表
+        """
+        try:
+            import textgrid
+            tg = textgrid.TextGrid.fromFile(textgrid_path)
+            
+            # 查找phones层
+            phoneme_tier = None
+            for tier in tg.tiers:
+                if tier.name == 'phones':
+                    phoneme_tier = tier
+                    break
+            
+            if phoneme_tier is None:
+                print(f"警告: 未找到phones层 in {textgrid_path}")
+                return []
+            
+            # 提取音素
+            phonemes = []
+            for interval in phoneme_tier:
+                if interval.mark.strip():  # 跳过空音素
+                    phonemes.append(interval.mark.strip())
+            
+            return phonemes
+            
+        except Exception as e:
+            print(f"从TextGrid提取音素失败 {textgrid_path}: {e}")
+            return []
+
+    
+    def _estimate_duration(self, phonemes, mel_len, textgrid_path):
+        """
+        从TextGrid文件读取MFA对齐结果，计算每个音素的duration
         """
         n_phonemes = len(phonemes)
         if n_phonemes == 0:
             return np.array([])
         
-        # 简单平均分配
-        avg_duration = mel_len / n_phonemes
-        durations = np.full(n_phonemes, avg_duration)
+        # 从TextGrid文件读取对齐结果
+        durations = self._read_textgrid_durations(textgrid_path)
+        if durations is None:
+            raise Exception("失败：无法从TextGrid文件读取对齐结果")
         
-        # 调整以确保总和等于 mel_len
-        diff = mel_len - durations.sum()
-        durations[0] += diff
+        if len(durations) != n_phonemes:
+            print(f"警告: TextGrid音素数量({len(durations)})与输入音素数量({n_phonemes})不匹配")
+            raise Exception(f"失败：TextGrid音素数量({len(durations)})与输入音素数量({n_phonemes})不匹配")
         
-        # 确保所有 duration >= 1
-        durations = np.maximum(durations, 1.0)
+        # 调整durations以确保总和等于mel_len
+        total_duration = durations.sum()
+        print('=' * 70)
+        print(f'durations: {durations}')
+        print(f'total_duration: {total_duration}')
+        print(f'mel_len: {mel_len}')
+        print('=' * 70)
+        if total_duration > 0 and total_duration != mel_len:
+            scale_factor = mel_len / total_duration
+            durations = durations * scale_factor
+            # 严格保证durations.sum() == mel_len且durations都是>=1的正整数
+            durations = self.adjust_durations(durations, mel_len)
+            assert durations.sum() == mel_len, f"失败：durations.sum() != mel_len"
+        else:
+            raise Exception("失败：TextGrid对齐结果为空")
         
         return durations
+
+    def adjust_durations(self, durations, target):
+        n = len(durations)
+        min_possible = n  # 每个元素至少为1的最小总和
+        if target < min_possible:
+            raise ValueError("target必须大于等于数组长度（每个元素至少为1）")
+        
+        # 先确保每个元素至少为1
+        adjusted = [max(1, np.floor(d).astype(np.int32)) for d in durations]
+        current_sum = sum(adjusted)
+        difference = target - current_sum
+        
+        if difference == 0:
+            return np.array(adjusted, dtype=np.float32)
+        
+        # 情况1：需要增加总和（difference > 0）
+        if difference > 0:
+            i = 0
+            while difference > 0:
+                adjusted[i] += 1
+                difference -= 1
+                i = (i + 1) % n  # 循环分配额外值
+        
+        # 情况2：需要减少总和（difference < 0）
+        else:
+            # 需要减少的总量（转为正数）
+            reduce_total = -difference
+            i = 0
+            while reduce_total > 0:
+                # 每个元素最多只能减到1（不能小于1）
+                max_reduce = adjusted[i] - 1
+                if max_reduce <= 0:
+                    i = (i + 1) % n  # 跳过已无法再减少的元素
+                    continue
+                # 本次实际减少的量（取可减少的最大值或剩余需要减少的量）
+                reduce = min(max_reduce, reduce_total)
+                adjusted[i] -= reduce
+                reduce_total -= reduce
+                i = (i + 1) % n  # 循环处理下一个元素
+        
+        return np.array(adjusted, dtype=np.float32)
     
     def _phoneme_level_pitch_energy(self, pitch, energy, durations):
         """
@@ -409,28 +555,37 @@ class LJSpeechDataset(Dataset):
         
         return np.array(phoneme_pitch), np.array(phoneme_energy)
     
-    def _preprocess_sample(self, raw_sample):
+    def _preprocess_sample(self, idx):
         """预处理单个样本"""
-        # 获取音频和文本
-        audio = raw_sample['audio']['array']
-        sr = raw_sample['audio']['sampling_rate']
-        text = raw_sample['normalized_text']
-
+        file_info = self.file_list[idx]
+        wav_path = file_info['wav_path']
+        lab_path = file_info['lab_path']
+        textgrid_path = file_info['textgrid_path']
+        
+        # 读取音频文件
+        audio, sr = librosa.load(wav_path, sr=None)
+        print(f"音频文件: {wav_path}")
+        print(f"采样率: {sr}")
+        print(f"音频形状: {audio.shape}")
+        print(f"音频: {audio}")
+        
         # 重采样到22050Hz
         if sr != self.audio_processor.sample_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.audio_processor.sample_rate)
         
-        # 归一化音频
-        audio = audio / (np.max(np.abs(audio)) + 1e-6)
+        # 不需要归一化音频，因为librosa.load已经归一化了
+        # audio = audio / (np.max(np.abs(audio)) + 1e-6)
         
-        # 文本转音素
-        phonemes = self._text_to_phonemes(text)
+        # 读取文本
+        text = self._read_lab_text(lab_path)
+        print(f"文本: {text}")
+        if not text:
+             return None
+        
+        # 从TextGrid文件直接获取音素
+        phonemes = self._extract_phonemes_from_textgrid(textgrid_path)
         if len(phonemes) == 0:
             return None
-        
-        # 添加音素到 tokenizer
-        for p in phonemes:
-            self.tokenizer.add_token(p)
         
         # 转换为 ID
         phoneme_ids = self.tokenizer.encode(phonemes)
@@ -439,15 +594,20 @@ class LJSpeechDataset(Dataset):
         mel = self.audio_processor.get_mel_spectrogram(audio)
         pitch = self.audio_processor.get_pitch(audio)
         energy = self.audio_processor.get_energy(audio)
+
+        print(f"mel: {mel.shape}")
+        print(f"pitch: {pitch.shape}")
+        print(f"energy: {energy.shape}")
         
         # 确保长度一致
+        assert mel.shape[0] == len(pitch) == len(energy), "失败：mel, pitch, energy长度不一致"
         min_len = min(mel.shape[0], len(pitch), len(energy))
         mel = mel[:min_len]
         pitch = pitch[:min_len]
         energy = energy[:min_len]
         
-        # 估计 duration
-        durations = self._estimate_duration(phonemes, mel.shape[0])
+        # 从TextGrid文件读取duration
+        durations = self._estimate_duration(phonemes, mel.shape[0], textgrid_path)
         
         # 转换为音素级的 pitch 和 energy
         phoneme_pitch, phoneme_energy = self._phoneme_level_pitch_energy(
@@ -455,30 +615,37 @@ class LJSpeechDataset(Dataset):
         )
         
         return {
+            'text': text,
+            'phonemes': phonemes,
             'phoneme_ids': np.array(phoneme_ids, dtype=np.int64),
             'text_length': len(phoneme_ids),
+            'phoneme_length': len(phonemes),
             'mel': mel.astype(np.float32),
             'mel_length': mel.shape[0],
             'duration': durations.astype(np.float32),
             'pitch': phoneme_pitch.astype(np.float32),
             'energy': phoneme_energy.astype(np.float32),
-            'text': text,
-            'phonemes': phonemes
+            'audio_path': wav_path
         }
     
     def __len__(self):
         return len(self.samples)
     
+    ## 此处作变量名称转换，为了适配训练程序的变量名称!!
     def __getitem__(self, idx):
         sample = self.samples[idx]
         return {
             'text': torch.from_numpy(sample['phoneme_ids']),
-            'text_length': sample['text_length'],
+            'text_length': len(sample['phoneme_ids']),
+            'raw_text': sample['text'],
+            'raw_text_length': len(sample['text']),
+            'phonemes': sample['phonemes'],
             'mel': torch.from_numpy(sample['mel']),
             'mel_length': sample['mel_length'],
             'duration': torch.from_numpy(sample['duration']),
             'pitch': torch.from_numpy(sample['pitch']),
-            'energy': torch.from_numpy(sample['energy'])
+            'energy': torch.from_numpy(sample['energy']),
+            'audio_path': sample['audio_path']
         }
 
 
@@ -551,9 +718,10 @@ if __name__ == "__main__":
     
     train_dataset = LJSpeechDataset(
         split='train',
-        cache_dir='./cache',
+        corpus_dir='./corpus',
+        aligned_dir='./corpus_aligned',
         processed_dir='./processed_data',
-        #max_samples=10,  # 快速测试，使用100个样本；实际训练时设为None
+        max_samples=10,  # 快速测试，使用10个样本；实际训练时设为None
         force_preprocess=False
     )
     
@@ -563,9 +731,10 @@ if __name__ == "__main__":
     
     val_dataset = LJSpeechDataset(
         split='validation',
-        cache_dir='./cache',
+        corpus_dir='./corpus',
+        aligned_dir='./corpus_aligned',
         processed_dir='./processed_data',
-        #max_samples=2,  # 快速测试；实际训练时设为None
+        max_samples=2,  # 快速测试；实际训练时设为None
         force_preprocess=False
     )
     
@@ -609,6 +778,20 @@ if __name__ == "__main__":
     print(f"Batch text lengths: {batch['text_lengths'].tolist()}")
     print(f"Batch mel shape: {batch['mel'].shape}")
     print(f"Batch mel lengths: {batch['mel_lengths'].tolist()}")
+    
+    # 打印第1个元素（索引0）的详细信息
+    print("\n" + "=" * 70)
+    print("第1个元素详细信息")
+    print("=" * 70)
+    first_element = batch['text'][0]
+    print(f"第1个元素的text: {first_element}")
+    print(f"第1个元素的text长度: {batch['text_lengths'][0].item()}")
+    print(f"第1个元素的mel shape: {batch['mel'][0].shape}")
+    print(f"第1个元素的mel: {batch['mel'][0]}")
+    print(f"第1个元素的mel长度: {batch['mel_lengths'][0].item()}")
+    print(f"第1个元素的duration: {batch['duration'][0]}")
+    print(f"第1个元素的pitch: {batch['pitch'][0]}")
+    print(f"第1个元素的energy: {batch['energy'][0]}")
     
     print("\n" + "=" * 70)
     print("✓ 数据加载测试完成！")

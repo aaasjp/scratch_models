@@ -4,3 +4,6 @@ checkpoints/
 logs/
 outputs/
 processed_data/
+dataset.log
+corpus/
+corpus_aligned/
