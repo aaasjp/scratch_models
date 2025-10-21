@@ -23,117 +23,105 @@ from fastspeech2_dataset import PhonemeTokenizer
 class HiFiGANVocoder:
     """HiFi-GAN 声码器(使用预训练模型)"""
     def __init__(self, device='cuda'):
-        self.device = device
-        
-        try:
-            # 尝试使用torch.hub加载预训练HiFi-GAN
-            # 这是一个LJSpeech预训练的HiFi-GAN
-            print("正在加载 HiFi-GAN 预训练模型...")
-            self.model = torch.hub.load(
-                'descriptinc/melgan-neurips',
-                'load_melgan',
-                'multi_speaker'
-            )
-            self.model = self.model.to(device)
-            self.model.eval()
-            print("✓ HiFi-GAN 加载成功")
-            self.available = True
-        except Exception as e:
-            print(f"警告: 无法加载HiFi-GAN: {e}")
-            print("将使用改进的Griffin-Lim作为备选")
-            self.available = False
-            self.setup_griffin_lim()
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.generator = None
+        self.h = None
+        self._load_model()
     
-    def setup_griffin_lim(self):
-        """设置改进的Griffin-Lim参数"""
-        self.sample_rate = 22050
-        self.n_fft = 1024
-        self.hop_length = 256
-        self.win_length = 1024
-        self.n_mels = 80
-        
-        # 创建梅尔滤波器
-        self.mel_basis = librosa.filters.mel(
-            sr=self.sample_rate,
-            n_fft=self.n_fft,
-            n_mels=self.n_mels,
-            fmin=0,
-            fmax=8000
-        )
+    def _load_model(self):
+        """加载HiFi-GAN模型"""
+        try:
+            # 导入必要的模块
+            import sys
+            import os
+            sys.path.append(os.path.join(os.path.dirname(__file__), 'hifi_gan'))
+            
+            from hifi_gan.models import Generator
+            from hifi_gan.env import AttrDict
+            from hifi_gan.meldataset import MAX_WAV_VALUE
+            import json
+            
+            # 加载配置
+            config_file = './hifi_gan/pretrained_models/LJ_V1/config.json'
+            if not os.path.exists(config_file):
+                raise FileNotFoundError(f"找不到HiFi-GAN配置文件: {config_file}")
+                
+            with open(config_file) as f:
+                data = f.read()
+            json_config = json.loads(data)
+            self.h = AttrDict(json_config)
+            
+            # 创建生成器
+            self.generator = Generator(self.h).to(self.device)
+            
+            # 加载预训练权重
+            checkpoint_path = './hifi_gan/pretrained_models/LJ_V1/generator_v1'
+            if not os.path.exists(checkpoint_path):
+                raise FileNotFoundError(f"找不到HiFi-GAN预训练模型: {checkpoint_path}")
+                
+            state_dict_g = torch.load(checkpoint_path, map_location=self.device)
+            self.generator.load_state_dict(state_dict_g['generator'])
+            
+            self.generator.eval()
+            self.generator.remove_weight_norm()
+            
+            print(f"✓ HiFi-GAN声码器加载成功")
+            print(f"  采样率: {self.h.sampling_rate}")
+            print(f"  设备: {self.device}")
+            
+        except Exception as e:
+            print(f"✗ HiFi-GAN声码器加载失败: {e}")
+            self.generator = None
     
     def mel_to_audio(self, mel_spectrogram):
         """
         将梅尔频谱转换为音频
         
         Args:
-            mel_spectrogram: [T, n_mels] numpy array (dB scale)
+            mel_spectrogram: [n_mels, T] 梅尔频谱
         
         Returns:
-            audio: [T * hop_length] numpy array
+            audio: 音频波形
         """
-        if self.available:
-            # 使用HiFi-GAN
-            return self._hifigan_inference(mel_spectrogram)
-        else:
-            # 使用改进的Griffin-Lim
-            return self._improved_griffin_lim(mel_spectrogram)
+        if self.generator is None:
+            print("✗ HiFi-GAN声码器未加载，返回空音频")
+            return np.array([])
+        
+        try:
+            # 转换梅尔频谱格式 (参考test_convert_mel_to_wav.py)
+            mel_magnitude = np.sqrt(mel_spectrogram + 1e-9)  # 对应torch中的sqrt操作
+            
+            # 使用torch风格的对数压缩
+            C = 1
+            clip_val = 1e-5
+            mel_compressed = np.log(np.clip(mel_magnitude, a_min=clip_val, a_max=None) * C)
+            
+            # 转换为tensor并添加batch维度
+            x = torch.FloatTensor(mel_compressed).to(self.device)
+            x = x.unsqueeze(0)  # [1, n_mels, T]
+            
+            with torch.no_grad():
+                # 生成音频
+                y_g_hat = self.generator(x)
+                audio = y_g_hat.squeeze()  # 移除batch维度
+                
+                # 转换为numpy数组并归一化到[-1, 1]范围
+                audio = audio.cpu().numpy()
+                
+            return audio
+            
+        except Exception as e:
+            print(f"✗ 音频生成失败: {e}")
+            return np.array([]) 
     
-    def _hifigan_inference(self, mel_spectrogram):
-        """使用HiFi-GAN生成音频"""
-        # 转换为tensor并调整形状
-        mel = torch.FloatTensor(mel_spectrogram.T).unsqueeze(0).to(self.device)
-        
-        # 归一化到 [-1, 1] 范围
-        mel = (mel - mel.mean()) / (mel.std() + 1e-5)
-        
-        with torch.no_grad():
-            audio = self.model.inverse(mel).squeeze()
-        
-        audio = audio.cpu().numpy()
-        return audio
-    
-    def _improved_griffin_lim(self, mel_spectrogram):
-        """改进的Griffin-Lim算法"""
-        # 转置为 [n_mels, T]
-        mel = mel_spectrogram.T
-        
-        # 从dB转回功率
-        mel_power = librosa.db_to_power(mel)
-        
-        # 确保所有值为正
-        mel_power = np.maximum(mel_power, 1e-10)
-        
-        # 逆梅尔滤波器(使用伪逆)
-        linear_spec = np.dot(np.linalg.pinv(self.mel_basis), mel_power)
-        linear_spec = np.maximum(linear_spec, 1e-10)
-        
-        # 改进的Griffin-Lim: 更多迭代次数,更好的初始化
-        audio = librosa.griffinlim(
-            linear_spec,
-            n_iter=64,  # 增加迭代次数(从32到64)
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            n_fft=self.n_fft,
-            window='hann',
-            center=True,
-            dtype=np.float32,
-            length=None,
-            pad_mode='reflect',
-            momentum=0.99,  # 添加动量加速收敛
-            init='random',  # 随机初始化相位
-            random_state=0
-        )
-        
-        # 后处理: 轻度滤波减少噪音
-        audio = librosa.effects.preemphasis(audio, coef=0.97)
-        
-        return audio
+
 
 
 class FastSpeech2Inference:
     """FastSpeech2 推理器(改进版)"""
-    def __init__(self, checkpoint_path, device='cuda', use_hifigan=True):
+    def __init__(self, checkpoint_path, device='cuda', use_hifigan=True, phonemes_file=None):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.phonemes_file = phonemes_file
         print(f"使用设备: {self.device}")
         
         # 加载检查点
@@ -142,7 +130,6 @@ class FastSpeech2Inference:
         
         # 获取配置
         self.config = checkpoint.get('config', {})
-        vocab_size = self.config.get('vocab_size', 100)
         
         # 加载tokenizer
         tokenizer_path = './processed_data/tokenizer.json'
@@ -161,24 +148,30 @@ class FastSpeech2Inference:
             print(f"✓ 加载统计信息")
             print(f"  Pitch range: [{self.stats['pitch_min']:.1f}, {self.stats['pitch_max']:.1f}]")
             print(f"  Energy range: [{self.stats['energy_min']:.4f}, {self.stats['energy_max']:.4f}]")
+            print(f"  Duration range: [{self.stats['duration_min']:.4f}, {self.stats['duration_max']:.4f}]")
+            print(f"  Mel range: [{self.stats['mel_min']:.4f}, {self.stats['mel_max']:.4f}]")
+            print(f"  Pitch mean: {self.stats['pitch_mean']:.1f}")
+            print(f"  Energy mean: {self.stats['energy_mean']:.4f}")
+            print(f"  Duration mean: {self.stats['duration_mean']:.4f}")
+            print(f"  Mel mean: {self.stats['mel_mean']:.4f}")
+            print(f"  Pitch std: {self.stats['pitch_std']:.1f}")
+            print(f"  Energy std: {self.stats['energy_std']:.4f}")
+            print(f"  Duration std: {self.stats['duration_std']:.4f}")
+            print(f"  Mel std: {self.stats['mel_std']:.4f}")
         else:
-            print("警告: 找不到统计信息,使用默认值")
-            self.stats = {
-                'pitch_min': 0.0, 'pitch_max': 800.0,
-                'pitch_mean': 200.0, 'pitch_std': 50.0,
-                'energy_min': 0.0, 'energy_max': 1.0,
-                'energy_mean': 0.5, 'energy_std': 0.1
-            }
+            raise FileNotFoundError(f"找不到统计信息: {stats_path}")
         
         # 创建模型
         self.model = FastSpeech2(
             vocab_size=vocab_size,
             d_model=self.config.get('d_model', 256),
-            n_layers=self.config.get('n_layers', 4),
+            n_layers=self.config.get('n_layers', 8),
             n_heads=self.config.get('n_heads', 2),
             d_ff=self.config.get('d_ff', 1024),
             dropout=self.config.get('dropout', 0.1),
-            n_mel_channels=80
+            n_mel_channels=80,
+            max_seq_len=1000,
+            stats_path=stats_path
         )
         
         # 加载模型权重
@@ -194,61 +187,124 @@ class FastSpeech2Inference:
         
         # 初始化声码器
         self.vocoder = HiFiGANVocoder(device=self.device)
-        
+        '''
         # 更新模型的统计信息
         self.model.variance_adaptor.pitch_min = torch.tensor(self.stats['pitch_min'])
         self.model.variance_adaptor.pitch_max = torch.tensor(self.stats['pitch_max'])
         self.model.variance_adaptor.energy_min = torch.tensor(self.stats['energy_min'])
         self.model.variance_adaptor.energy_max = torch.tensor(self.stats['energy_max'])
+        '''
     
-    def text_to_phonemes(self, text):
-        """将文本转换为音素"""
+    def denormalize_mel(self, mel_spectrogram, eps=1e-6):
+        """
+        对梅尔频谱进行逆归一化处理
+        
+        Args:
+            mel_spectrogram: 归一化后的梅尔频谱 [T, n_mels]
+            
+        Returns:
+            denormalized_mel: 逆归一化后的梅尔频谱 [n_mels, T]
+        """
+        # 逆标准化: x = (x_norm * std) + mean
+        mel_denorm = mel_spectrogram * (self.stats['mel_std'] + eps) + self.stats['mel_mean']
+        
+        # 逆裁剪: 确保在原始范围内
+        mel_denorm = np.clip(mel_denorm, self.stats['mel_min'], self.stats['mel_max'])
+        
+        print("--------------------------------")
+        print(f"mel_denorm.shape: {mel_denorm.shape}")
+        print(f"mel_denorm: {mel_denorm}")
+        print("--------------------------------")
+        # 先转换shape: [T, n_mels] -> [n_mels, T]
+        mel_denorm = mel_denorm.T
+        
+        # 逆对数处理: 从对数域转换回线性域
+        # 原始处理: mel_db = librosa.power_to_db(mel, ref=np.max)
+        # 逆处理: mel_linear = librosa.db_to_power(mel_db, ref=np.max)
+        # 计算参考值（使用梅尔频谱的最大值）
+        # ref_value = np.max(mel_denorm)
+        mel_linear = librosa.db_to_power(mel_denorm, ref=1.0)
+        print("--------------------------------")
+        print(f"mel_linear.shape: {mel_linear.shape}")
+        print(f"mel_linear: {mel_linear}")
+        print("--------------------------------")
+        return mel_linear
+    
+    
+    def load_phonemes_from_file(self, phonemes_file):
+        """
+        从音素文件中读取音素数据
+        
+        Args:
+            phonemes_file: 音素文件路径
+            
+        Returns:
+            phonemes: 音素列表
+        """
         try:
-            text = text.lower().strip()
+            if not os.path.exists(phonemes_file):
+                raise FileNotFoundError(f"音素文件不存在: {phonemes_file}")
             
-            # 使用subprocess直接调用espeak
-            result = subprocess.run(
-                ['espeak', '-q', '--ipa', '-v', 'en-us', text],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+            phonemes = []
+            with open(phonemes_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:  # 跳过空行
+                        continue
+                    
+                    # 解析格式: word\tphoneme1 phoneme2 phoneme3
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        word = parts[0].strip()
+                        phoneme_sequence = parts[1].strip()
+                        
+                        # 将音素序列分割成单个音素
+                        phoneme_list = phoneme_sequence.split()
+                        phonemes.extend(phoneme_list)
+                    else:
+                        # 如果格式不正确，尝试直接分割
+                        phoneme_list = line.split()
+                        phonemes.extend(phoneme_list)
             
-            if result.returncode == 0:
-                phonemes = result.stdout.strip()
-                # 简单的音素分割
-                phoneme_list = [p for p in phonemes if p.isalpha() or p in 'ɪəʊʌɒËæeɪaɪɔɪəʊaʊɪəeəʊə']
-                
-                if phoneme_list:
-                    return phoneme_list
-                else:
-                    return list(text.replace(' ', '_'))
-            else:
-                return list(text.replace(' ', '_'))
-                
+            print(f"✓ 从文件加载音素: {len(phonemes)} 个音素")
+            print(f"  前10个音素: {phonemes[:10]}")
+            
+            return phonemes
+            
         except Exception as e:
-            print(f"音素转换失败: {e}")
-            return list(text.replace(' ', '_'))
+            print(f"加载音素文件失败: {e}")
+            return []
     
     @torch.no_grad()
-    def synthesize(self, text, duration_control=1.0, pitch_control=1.0, energy_control=1.0):
+    def synthesize(self, text=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0):
         """
-        从文本合成语音(改进版)
+        从文本或音素文件合成语音(改进版)
+        
+        Args:
+            text: 输入文本(如果提供了phonemes_file则忽略)
+            duration_control: 语速控制
+            pitch_control: 音高控制  
+            energy_control: 能量控制
         """
         print(f"\n{'='*60}")
-        print(f"合成文本: {text}")
-        print(f"{'='*60}")
         
-        # 文本转音素
-        phonemes = self.text_to_phonemes(text)
-        if len(phonemes) == 0:
-            raise ValueError("无法转换文本为音素")
+        # 获取音素
+        if self.phonemes_file and os.path.exists(self.phonemes_file):
+            print(f"从音素文件合成: {self.phonemes_file}")
+            phonemes = self.load_phonemes_from_file(self.phonemes_file)
+            if len(phonemes) == 0:
+                raise ValueError("无法从音素文件加载音素")
+        else:
+            raise ValueError("必须提供phonemes_file参数")
+            
+        print(f"{'='*60}")
         
         print(f"音素: {' '.join(phonemes)}")
         print(f"音素数量: {len(phonemes)}")
         
         # 转换为ID
         phoneme_ids = self.tokenizer.encode(phonemes)
+        print(f"phoneme_ids: {phoneme_ids}")
         text_tensor = torch.LongTensor(phoneme_ids).unsqueeze(0).to(self.device)
         text_lengths = torch.LongTensor([len(phoneme_ids)]).to(self.device)
         
@@ -276,13 +332,15 @@ class FastSpeech2Inference:
         print(f"  时长: {mel_length * 256 / 22050:.2f} 秒")
         
         # 梅尔频谱后处理(关键!)
-        # 1. 去归一化(如果训练时做了归一化)
-        mel_mean = mel_spectrogram.mean()
-        mel_std = mel_spectrogram.std()
-        print(f"  Mel统计: mean={mel_mean:.2f}, std={mel_std:.2f}")
+        # 逆归一化处理
+        print(f"正在对梅尔频谱进行逆归一化...")
+        mel_spectrogram = self.denormalize_mel(mel_spectrogram)
         
-        # 2. 确保范围合理
-        # mel_spectrogram = np.clip(mel_spectrogram, -80, 0)
+        print(f"✓ 逆归一化完成")
+        print(f"  梅尔频谱shape: {mel_spectrogram.shape} (已转换为[n_mels, T])")
+        print(f"  梅尔频谱范围: [{mel_spectrogram.min():.4f}, {mel_spectrogram.max():.4f}]")
+        print(f"  梅尔频谱均值: {mel_spectrogram.mean():.4f}")
+        print(f"  梅尔频谱标准差: {mel_spectrogram.std():.4f}")
         
         # 使用声码器生成音频
         print(f"\n正在生成音频波形...")
@@ -300,29 +358,35 @@ class FastSpeech2Inference:
             'duration_control': duration_control,
             'pitch_control': pitch_control,
             'energy_control': energy_control,
-            'mel_mean': float(mel_mean),
-            'mel_std': float(mel_std)
+            'mel_mean': float(mel_spectrogram.mean()),
+            'mel_std': float(mel_spectrogram.std())
         }
         
         return audio, mel_spectrogram, info
     
-    def save_audio(self, audio, output_path, sample_rate=22050):
-        """保存音频文件"""
-        # 归一化
-        audio = audio / (np.max(np.abs(audio)) + 1e-6)
-        # 轻微限幅防止削波
-        audio = np.clip(audio, -0.95, 0.95)
-        audio = (audio * 32767).astype(np.int16)
+    def save_audio(self, audio, output_path):
+        """
+        保存音频文件
         
-        wavfile.write(output_path, sample_rate, audio)
-        print(f"\n✓ 音频已保存: {output_path}")
+        Args:
+            audio: 音频数据
+            output_path: 输出路径
+        """
+        # 按照HiFi-GAN的方式保存音频
+        # 音频乘以MAX_WAV_VALUE并转换为int16
+        audio_int16 = (audio * 32767).astype(np.int16)
+        
+        # 保存为WAV文件
+        wavfile.write(output_path, 22050, audio_int16)
+        print(f"✓ 音频已保存到: {output_path}")
+    
 
 
 def main():
     parser = argparse.ArgumentParser(description='FastSpeech2 Inference (Improved)')
     
-    parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--text', type=str, default=None)
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pth')
+    parser.add_argument('--phonemes_file', type=str, default='./output_phonemes.txt')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--duration_control', type=float, default=1.0)
     parser.add_argument('--pitch_control', type=float, default=1.0)
@@ -338,28 +402,24 @@ def main():
     print("FastSpeech2 改进版推理系统")
     print("="*70)
     
-    inferencer = FastSpeech2Inference(args.checkpoint, device=args.device)
+    inferencer = FastSpeech2Inference(args.checkpoint, device=args.device, phonemes_file=args.phonemes_file)
     
-    # 测试文本
-    texts = [args.text] if args.text else [
-        "Hello world, this is a test.",
-        "The quick brown fox jumps over the lazy dog.",
-    ]
-    
-    for idx, text in enumerate(texts):
+    # 处理输入
+    if args.phonemes_file and os.path.exists(args.phonemes_file):
+        # 使用音素文件
+        print(f"使用音素文件: {args.phonemes_file}")
         try:
             audio, mel, info = inferencer.synthesize(
-                text,
                 duration_control=args.duration_control,
                 pitch_control=args.pitch_control,
                 energy_control=args.energy_control
             )
             
-            audio_path = os.path.join(args.output_dir, f'output_{idx:03d}.wav')
+            audio_path = os.path.join(args.output_dir, 'output_from_phonemes.wav')
             inferencer.save_audio(audio, audio_path)
             
             # 保存信息
-            info_path = os.path.join(args.output_dir, f'info_{idx:03d}.json')
+            info_path = os.path.join(args.output_dir, 'info_phonemes.json')
             with open(info_path, 'w', encoding='utf-8') as f:
                 json.dump(info, f, indent=2, ensure_ascii=False)
             
@@ -369,7 +429,8 @@ def main():
             print(f"\n✗ 合成失败: {e}\n")
             import traceback
             traceback.print_exc()
-            continue
+    else:
+        raise ValueError("必须提供phonemes_file参数")
     
     print("="*70)
     print(f"✓ 全部完成!输出目录: {args.output_dir}")

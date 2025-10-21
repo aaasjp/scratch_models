@@ -426,7 +426,7 @@ def main():
     # 模型参数
     parser.add_argument('--d_model', type=int, default=256,
                         help='模型隐藏层维度')
-    parser.add_argument('--n_layers', type=int, default=4,
+    parser.add_argument('--n_layers', type=int, default=8,
                         help='Transformer 层数')
     parser.add_argument('--n_heads', type=int, default=2,
                         help='注意力头数')
@@ -436,9 +436,9 @@ def main():
                         help='Dropout 率')
     
     # 训练参数
-    parser.add_argument('--num_epochs', type=int, default=30,
+    parser.add_argument('--num_epochs', type=int, default=20,
                         help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=1,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='批大小')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='学习率')

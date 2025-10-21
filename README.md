@@ -17,3 +17,4 @@ No module named '_kalpy'
 用pip安装 MFA，缺少底层 Kalpy 引擎
 改用 conda install -c conda-forge montreal-forced-aligner
 
+mfa g2p input_texts.txt english_us_arpa  output_phonemes.txt --num_pronunciations 1

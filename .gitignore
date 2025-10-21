@@ -7,3 +7,6 @@ processed_data/
 dataset.log
 corpus/
 corpus_aligned/
+test_files/
+test_generated_files/
+pretrained_models/
