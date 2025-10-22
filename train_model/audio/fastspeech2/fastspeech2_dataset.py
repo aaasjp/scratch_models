@@ -112,7 +112,8 @@ class AudioProcessor:
         )
         
         # 转换到对数域
-        mel_db = librosa.power_to_db(mel, ref=np.max)
+        # mel_db = librosa.power_to_db(mel, ref=np.max)
+        mel_db = librosa.power_to_db(mel, ref=1.0)
         
         return mel_db.T  # [T, n_mels]
     
@@ -144,6 +145,9 @@ class AudioProcessor:
 
         # YIN 不返回 NaN，但会返回超出 [fmin, fmax] 的值表示无效，所以将不可靠的 F0 设为 0.0
         f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
+        # 对f0加1后取log，避免log(0)的问题
+        f0 = 10 * np.log2(f0 + 1.0)
+        
         return f0
     '''
     def get_energy(self, audio):
@@ -171,6 +175,9 @@ class AudioProcessor:
         
         # 计算每帧的平方和作为能量
         energy = np.sum(np.abs(stft) ** 2, axis=0)
+        
+        # 对energy加1后取log，避免log(0)的问题
+        energy = 10 * np.log2(energy + 1.0)
         
         return energy
 
@@ -455,11 +462,11 @@ class LJSpeechDataset(Dataset):
         
         # 调整durations以确保总和等于mel_len
         total_duration = durations.sum()
-        print('=' * 70)
-        print(f'durations: {durations}')
-        print(f'total_duration: {total_duration}')
-        print(f'mel_len: {mel_len}')
-        print('=' * 70)
+        #print('=' * 70)
+        #print(f'durations: {durations}')
+        #print(f'total_duration: {total_duration}')
+        #print(f'mel_len: {mel_len}')
+        #print('=' * 70)
         if total_duration > 0 and total_duration != mel_len:
             scale_factor = mel_len / total_duration
             durations = durations * scale_factor
@@ -564,10 +571,6 @@ class LJSpeechDataset(Dataset):
         
         # 读取音频文件
         audio, sr = librosa.load(wav_path, sr=None)
-        print(f"音频文件: {wav_path}")
-        print(f"采样率: {sr}")
-        print(f"音频形状: {audio.shape}")
-        print(f"音频: {audio}")
         
         # 重采样到22050Hz
         if sr != self.audio_processor.sample_rate:
@@ -578,7 +581,6 @@ class LJSpeechDataset(Dataset):
         
         # 读取文本
         text = self._read_lab_text(lab_path)
-        print(f"文本: {text}")
         if not text:
              return None
         
@@ -594,10 +596,6 @@ class LJSpeechDataset(Dataset):
         mel = self.audio_processor.get_mel_spectrogram(audio)
         pitch = self.audio_processor.get_pitch(audio)
         energy = self.audio_processor.get_energy(audio)
-
-        print(f"mel: {mel.shape}")
-        print(f"pitch: {pitch.shape}")
-        print(f"energy: {energy.shape}")
         
         # 确保长度一致
         assert mel.shape[0] == len(pitch) == len(energy), "失败：mel, pitch, energy长度不一致"
@@ -721,7 +719,7 @@ if __name__ == "__main__":
         corpus_dir='./corpus',
         aligned_dir='./corpus_aligned',
         processed_dir='./processed_data',
-        max_samples=10,  # 快速测试，使用10个样本；实际训练时设为None
+        max_samples=None,  # 快速测试，使用150个样本；实际训练时设为None
         force_preprocess=False
     )
     
@@ -734,7 +732,7 @@ if __name__ == "__main__":
         corpus_dir='./corpus',
         aligned_dir='./corpus_aligned',
         processed_dir='./processed_data',
-        max_samples=2,  # 快速测试；实际训练时设为None
+        max_samples=None,  # 快速测试；实际训练时设为None
         force_preprocess=False
     )
     
@@ -745,25 +743,59 @@ if __name__ == "__main__":
     print(f"验证集大小: {len(val_dataset)}")
     print(f"词表大小: {len(train_dataset.tokenizer)}")
     
-    # 查看样本
+    # 查看所有样本
     print("\n" + "=" * 70)
-    print("样本示例")
-    print("=" * 70)
-    sample = train_dataset[0]
-    print(f"Text shape: {sample['text'].shape}")
-    print(f"Text length: {sample['text_length']}")
-    print(f"Mel shape: {sample['mel'].shape}")
-    print(f"Mel length: {sample['mel_length']}")
-    print(f"Duration shape: {sample['duration'].shape}")
-    print(f"Duration sum: {sample['duration'].sum().item():.1f}")
-    print(f"Pitch shape: {sample['pitch'].shape}")
-    print(f"Energy shape: {sample['energy'].shape}")
-    print(f"\n验证对齐: sum(duration)={sample['duration'].sum().item():.1f}, mel_length={sample['mel_length']}")
+    print(f"训练集样本数量: {len(train_dataset)}")
+    if len(train_dataset) > 0:
+        print("\n训练集样本详情:")
+        for i in range(len(train_dataset)):
+            print("=" * 70)
+            sample = train_dataset[i]
+            print(f"\n样本 {i+1}:")
+            print(f"  文本: {sample['raw_text']}")
+            print(f"  文本长度: {sample['raw_text_length']}")
+            print(f"  音素: {sample['phonemes']}")
+            print(f"  音素ID: {sample['text']}")
+            print(f"  音素长度: {sample['text_length']}")
+            print(f"  Mel频谱形状: {sample['mel'].shape}")
+            print(f"  Mel长度: {sample['mel_length']}")
+            print(f"  Duration长度: {len(sample['duration'])}")
+            print(f"  Durations: {sample['duration']}")
+            print(f"  Duration总和: {sample['duration'].sum().item():.1f}")
+            print(f"  Pitch形状: {sample['pitch'].shape}")
+            print(f"  Pitch: {sample['pitch']}")
+            print(f"  Energy形状: {sample['energy'].shape}")
+            print(f"  Energy: {sample['energy']}")
+            print(f"  音频路径: {sample['audio_path']}")
+            print(f"  验证对齐: sum(duration)={sample['duration'].sum().item():.1f}, mel_length={sample['mel_length']}")
+            print("=" * 70)
     
-    # 测试 DataLoader
+    # 查看验证集所有样本
     print("\n" + "=" * 70)
-    print("测试 DataLoader")
-    print("=" * 70)
+    print(f"验证集样本数量: {len(val_dataset)}")
+    if len(val_dataset) > 0:
+        print("\n验证集样本详情:")
+        for i in range(len(val_dataset)):
+            print("=" * 70)
+            sample = val_dataset[i]
+            print(f"\n样本 {i+1}:")
+            print(f"  文本: {sample['raw_text']}")
+            print(f"  文本长度: {sample['raw_text_length']}")
+            print(f"  音素: {sample['phonemes']}")
+            print(f"  音素ID: {sample['text']}")
+            print(f"  音素长度: {sample['text_length']}")
+            print(f"  Mel频谱形状: {sample['mel'].shape}")
+            print(f"  Mel长度: {sample['mel_length']}")
+            print(f"  Duration长度: {len(sample['duration'])}")
+            print(f"  Durations: {sample['duration']}")
+            print(f"  Duration总和: {sample['duration'].sum().item():.1f}")
+            print(f"  Pitch形状: {sample['pitch'].shape}")
+            print(f"  Pitch: {sample['pitch']}")
+            print(f"  Energy形状: {sample['energy'].shape}")
+            print(f"  Energy: {sample['energy']}")
+            print(f"  音频路径: {sample['audio_path']}")
+            print(f"  验证对齐: sum(duration)={sample['duration'].sum().item():.1f}, mel_length={sample['mel_length']}")
+            print("=" * 70)
     
     train_loader = DataLoader(
         train_dataset,
@@ -773,28 +805,8 @@ if __name__ == "__main__":
         num_workers=0
     )
     
-    batch = next(iter(train_loader))
-    print(f"Batch text shape: {batch['text'].shape}")
-    print(f"Batch text lengths: {batch['text_lengths'].tolist()}")
-    print(f"Batch mel shape: {batch['mel'].shape}")
-    print(f"Batch mel lengths: {batch['mel_lengths'].tolist()}")
-    
-    # 打印第1个元素（索引0）的详细信息
     print("\n" + "=" * 70)
-    print("第1个元素详细信息")
-    print("=" * 70)
-    first_element = batch['text'][0]
-    print(f"第1个元素的text: {first_element}")
-    print(f"第1个元素的text长度: {batch['text_lengths'][0].item()}")
-    print(f"第1个元素的mel shape: {batch['mel'][0].shape}")
-    print(f"第1个元素的mel: {batch['mel'][0]}")
-    print(f"第1个元素的mel长度: {batch['mel_lengths'][0].item()}")
-    print(f"第1个元素的duration: {batch['duration'][0]}")
-    print(f"第1个元素的pitch: {batch['pitch'][0]}")
-    print(f"第1个元素的energy: {batch['energy'][0]}")
-    
-    print("\n" + "=" * 70)
-    print("✓ 数据加载测试完成！")
+    print("✓ 数据加载完成！")
     print("=" * 70)
     
     print("\n下一步:")

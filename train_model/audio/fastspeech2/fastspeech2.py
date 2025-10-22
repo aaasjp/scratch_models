@@ -368,7 +368,7 @@ class FastSpeech2(nn.Module):
         self,
         vocab_size,
         d_model=256,
-        n_layers=4,
+        n_layers=8,
         n_heads=2,
         d_ff=1024,
         dropout=0.1,
@@ -502,7 +502,7 @@ if __name__ == "__main__":
     model = FastSpeech2(
         vocab_size=100,
         d_model=256,
-        n_layers=4,
+        n_layers=8,
         n_heads=2,
         d_ff=1024,
         n_mel_channels=80
