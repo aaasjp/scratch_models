@@ -14,6 +14,8 @@
 - **灵活的数据处理**：支持多种音频格式和文本预处理
 - **详细的训练监控**：完整的训练日志和可视化
 - **易于使用的推理接口**：简单的文本到语音转换
+- **🎨 模型可视化**：自动生成架构图和层次结构图
+- **📊 参数统计**：详细的模型参数分析和统计信息
 
 ## 📋 系统要求
 
@@ -68,11 +70,15 @@ fastspeech2/
 ├── 📄 hifigan_vocoder.py          # HiFi-GAN 声码器
 ├── 📄 length_regulator.py         # 长度调节器
 ├── 📄 audio_to_mel_spectrogram.py # 音频处理工具
+├── 📄 test_model_visualization.py # 模型可视化测试脚本
 ├── 📁 corpus/                     # 原始音频数据
 ├── 📁 corpus_aligned/             # 音素对齐数据
 ├── 📁 processed_data/             # 处理后的训练数据
 ├── 📁 checkpoints/                # 模型检查点
 ├── 📁 outputs/                    # 推理输出
+├── 📁 model_structure/            # 模型结构图
+│   ├── fastspeech2_architecture.png  # 架构图
+│   └── fastspeech2_hierarchy.png      # 层次结构图
 ├── 📁 hifi_gan/                   # HiFi-GAN 声码器实现
 ├── 📁 test_files/                 # 测试音频文件
 └── 📄 模型训练推理操作步骤说明.md  # 详细操作指南
@@ -132,6 +138,17 @@ python fastspeech2_inference.py
 
 生成的音频文件将保存在 `./outputs/output_from_phonemes.wav`。
 
+### 5. 模型可视化
+
+```bash
+# 生成模型结构图
+python test_model_visualization.py
+```
+
+这将生成以下可视化文件：
+- `./model_structure/fastspeech2_architecture.png` - 模型架构图
+- `./model_structure/fastspeech2_hierarchy.png` - 模型层次结构图
+
 ## 📊 模型架构
 
 ### FastSpeech2 核心组件
@@ -144,6 +161,34 @@ python fastspeech2_inference.py
 ### 声码器
 
 - **HiFi-GAN**：高质量声码器，将梅尔频谱图转换为音频波形
+
+### 🎨 模型可视化
+
+项目提供了自动化的模型结构可视化功能：
+
+#### 架构图 (Architecture Diagram)
+- 清晰展示数据流向
+- 显示各组件之间的连接关系
+- 包含中英文双语标签
+
+#### 层次结构图 (Hierarchy Diagram)
+- 详细的模型层次结构
+- 参数统计信息
+- 组件功能说明
+
+#### 使用方法
+```python
+from fastspeech2 import FastSpeech2, print_model_info, visualize_model_structure
+
+# 创建模型
+model = FastSpeech2(vocab_size=100, d_model=256)
+
+# 打印模型信息
+print_model_info(model)
+
+# 生成可视化图片
+visualize_model_structure(model, "./model_structure")
+```
 
 ## 🔧 配置选项
 
@@ -175,6 +220,9 @@ decoder_dim=256,        # 解码器维度
 - `logs/training_log.jsonl`：结构化训练数据
 - `checkpoints/`：模型检查点
 - `mel_output/`：梅尔频谱图可视化
+- `model_structure/`：模型结构图
+  - `fastspeech2_architecture.png`：架构图
+  - `fastspeech2_hierarchy.png`：层次结构图
 
 ## 🎯 性能指标
 
@@ -204,6 +252,15 @@ decoder_dim=256,        # 解码器维度
    - 确保文本为小写
    - 验证 MFA 模型是否正确下载
 
+4. **模型可视化问题**
+   ```bash
+   # 确保 matplotlib 正确安装
+   pip install matplotlib
+   
+   # 如果中文字体显示有问题
+   python -c "import matplotlib.pyplot as plt; print(plt.rcParams['font.sans-serif'])"
+   ```
+
 ### 日志分析
 
 ```bash
@@ -213,6 +270,45 @@ tail -f train.log
 # 查看数据集构建日志
 tail -f dataset.log
 ```
+
+## 🎨 模型可视化示例
+
+### 快速生成模型结构图
+
+```bash
+# 运行可视化测试脚本
+python test_model_visualization.py
+```
+
+### 在代码中使用可视化功能
+
+```python
+import torch
+from fastspeech2 import FastSpeech2, print_model_info, visualize_model_structure
+
+# 创建模型
+model = FastSpeech2(
+    vocab_size=100,
+    d_model=256,
+    n_layers=8,
+    n_heads=2,
+    d_ff=1024,
+    n_mel_channels=80
+)
+
+# 打印详细的模型信息
+print_model_info(model)
+
+# 生成模型结构图
+visualize_model_structure(model, "./my_model_structure")
+```
+
+### 可视化输出
+
+运行后会生成：
+- **架构图**：展示数据流向和组件连接
+- **层次结构图**：详细的模型层次和参数统计
+- **文本信息**：完整的模型参数分析
 
 ## 📚 参考资料
 

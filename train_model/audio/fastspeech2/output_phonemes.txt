@@ -1,13 +1,8 @@
-hello	HH EH1 L OW0
-world	W ER1 L D
-hello	HH EH1 L OW0
-everyone	EH1 V R IY0 W AH2 N
-t's	T S
-a	AH0
-great	G R EY1 T
-honor	AA1 N ER0
-to	T OW0
-participate	P AA0 R T IH1 S AH0 P EY2 T
-in	IH0 N
-this	DH IH0 S
-meeting	M IY1 T IH0 NG
+hihow	HH AW2
+are	AA1 R IY0
+you	Y UW1
+may	M EY1
+i	AY1
+eat	IY1 T
+an	AH0 N
+apple	AE1 P AH0 L

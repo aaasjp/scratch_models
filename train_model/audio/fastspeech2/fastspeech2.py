@@ -5,6 +5,44 @@ import torch.nn.functional as F
 import math
 import json
 import os
+import matplotlib.pyplot as plt
+import matplotlib
+from torchviz import make_dot
+import tempfile
+
+# 设置中文字体支持
+def setup_chinese_font():
+    """设置中文字体支持"""
+    import platform
+    
+    system = platform.system()
+    chinese_fonts = []
+    
+    if system == "Darwin":  # macOS
+        chinese_fonts = ['Arial Unicode MS', 'PingFang SC', 'Hiragino Sans GB', 'STHeiti']
+    elif system == "Windows":
+        chinese_fonts = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong']
+    else:  # Linux
+        chinese_fonts = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Noto Sans CJK SC']
+    
+    # 添加通用字体作为备选
+    chinese_fonts.extend(['DejaVu Sans', 'Liberation Sans', 'Arial'])
+    
+    plt.rcParams['font.sans-serif'] = chinese_fonts
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    
+    # 测试字体是否可用
+    try:
+        fig, ax = plt.subplots(figsize=(1, 1))
+        ax.text(0.5, 0.5, '测试中文', fontsize=12)
+        plt.close(fig)
+        print(f"✅ 中文字体设置成功，使用字体: {plt.rcParams['font.sans-serif'][0]}")
+    except Exception as e:
+        print(f"⚠️ 中文字体设置可能有问题: {e}")
+        print("建议安装中文字体或使用英文标签")
+
+# 初始化中文字体
+setup_chinese_font()
 
 
 def get_mask_from_lengths(lengths, max_len=None):
@@ -489,6 +527,340 @@ class FastSpeech2(nn.Module):
         return mel_output, mel_mask, duration_pred, pitch_pred, energy_pred, mel_lengths
 
 
+def print_model_info(model):
+    """打印模型详细信息和结构"""
+    print("\n" + "=" * 80)
+    print("FastSpeech2 模型结构")
+    print("=" * 80)
+    print(model)
+    
+    print("\n" + "=" * 80)
+    print("模型参数统计")
+    print("=" * 80)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"总参数数量: {total_params:,}")
+    print(f"可训练参数: {trainable_params:,}")
+    print(f"模型大小: {total_params * 4 / 1024 / 1024:.2f} MB (FP32)")
+    
+    print("\n" + "=" * 80)
+    print("各组件参数统计")
+    print("=" * 80)
+    
+    # 文本嵌入层
+    embedding_params = sum(p.numel() for p in model.embedding.parameters())
+    print(f"文本嵌入层参数: {embedding_params:,}")
+    
+    # 编码器参数
+    encoder_params = sum(p.numel() for p in model.encoder.parameters())
+    print(f"编码器参数: {encoder_params:,}")
+    
+    # 方差适配器参数
+    variance_params = sum(p.numel() for p in model.variance_adaptor.parameters())
+    print(f"方差适配器参数: {variance_params:,}")
+    
+    # 解码器参数
+    decoder_params = sum(p.numel() for p in model.decoder.parameters())
+    print(f"解码器参数: {decoder_params:,}")
+    
+    # 输出层参数
+    output_params = sum(p.numel() for p in model.mel_linear.parameters())
+    print(f"输出层参数: {output_params:,}")
+    
+    print("\n" + "=" * 80)
+    print("模型配置信息")
+    print("=" * 80)
+    print(f"词汇表大小: {model.embedding.num_embeddings}")
+    print(f"模型维度: {model.d_model}")
+    print(f"编码器层数: {len(model.encoder)}")
+    print(f"解码器层数: {len(model.decoder)}")
+    print(f"注意力头数: {model.encoder[0].attention.n_heads}")
+    print(f"前馈网络维度: {model.encoder[0].ff.fc1.out_features}")
+    print(f"梅尔频谱通道数: {model.mel_linear.out_features}")
+    
+    print("\n" + "=" * 80)
+    print("方差适配器详细信息")
+    print("=" * 80)
+    print(f"Duration预测器参数: {sum(p.numel() for p in model.variance_adaptor.duration_predictor.parameters()):,}")
+    print(f"Pitch预测器参数: {sum(p.numel() for p in model.variance_adaptor.pitch_predictor.parameters()):,}")
+    print(f"Energy预测器参数: {sum(p.numel() for p in model.variance_adaptor.energy_predictor.parameters()):,}")
+    print(f"Pitch嵌入维度: {model.variance_adaptor.pitch_embedding.num_embeddings}")
+    print(f"Energy嵌入维度: {model.variance_adaptor.energy_embedding.num_embeddings}")
+    
+    print("\n" + "=" * 80)
+    print("模型结构层次")
+    print("=" * 80)
+    print("1. 文本嵌入层 (Embedding)")
+    print("2. 位置编码 (Positional Encoding)")
+    print("3. 编码器 (Encoder)")
+    print("   - 8层 FFT Block")
+    print("   - 每层包含: MultiHeadAttention + LayerNorm + FeedForward + LayerNorm")
+    print("4. 方差适配器 (Variance Adaptor)")
+    print("   - Duration预测器")
+    print("   - Pitch预测器")
+    print("   - Energy预测器")
+    print("   - Length调节器")
+    print("5. 解码器 (Decoder)")
+    print("   - 8层 FFT Block")
+    print("6. 输出层 (Mel Linear)")
+    
+    print("\n" + "=" * 80)
+    print("模型打印完成！")
+    print("=" * 80)
+
+
+def visualize_model_structure(model, save_dir="./model_structure"):
+    """可视化模型结构并保存为图片"""
+    print("\n" + "=" * 80)
+    print("生成模型结构图")
+    print("=" * 80)
+    
+    try:
+        # 创建保存目录
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"✅ 创建保存目录: {save_dir}")
+        
+        # 生成架构图
+        print("正在生成模型架构图...")
+        architecture_path = os.path.join(save_dir, "fastspeech2_architecture.png")
+        create_architecture_diagram(architecture_path)
+        print(f"✅ 架构图已保存到: {architecture_path}")
+        
+        # 生成层次结构图
+        print("正在生成模型层次结构图...")
+        hierarchy_path = os.path.join(save_dir, "fastspeech2_hierarchy.png")
+        create_hierarchy_diagram(hierarchy_path, model)
+        print(f"✅ 层次结构图已保存到: {hierarchy_path}")
+        
+        print(f"\n🎉 所有模型结构图已成功生成并保存到: {save_dir}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ 生成模型结构图失败: {e}")
+        return False
+
+
+def create_architecture_diagram(save_path="model_architecture.png"):
+    """创建模型架构图"""
+    print("正在生成模型架构图...")
+    
+    # 创建图形
+    fig, ax = plt.subplots(1, 1, figsize=(16, 12))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 12)
+    ax.axis('off')
+    
+    # 定义组件位置和大小（中英文双语）
+    components = [
+        {"name": "Text Input\n[Batch, Seq]\n文本输入", "pos": (1, 10.5), "size": (1.5, 0.8), "color": "lightblue"},
+        {"name": "Embedding\n+ Position\n嵌入+位置编码", "pos": (1, 9.5), "size": (1.5, 0.8), "color": "lightgreen"},
+        {"name": "Encoder\n(8 FFT Blocks)\n编码器(8层)", "pos": (1, 8), "size": (1.5, 1.2), "color": "lightcoral"},
+        {"name": "Variance Adaptor\n方差适配器", "pos": (4, 8), "size": (2, 1.2), "color": "lightyellow"},
+        {"name": "Duration\nPredictor\n时长预测器", "pos": (3.5, 6.5), "size": (1, 0.6), "color": "lightpink"},
+        {"name": "Pitch\nPredictor\n音高预测器", "pos": (4.5, 6.5), "size": (1, 0.6), "color": "lightpink"},
+        {"name": "Energy\nPredictor\n能量预测器", "pos": (5.5, 6.5), "size": (1, 0.6), "color": "lightpink"},
+        {"name": "Length\nRegulator\n长度调节器", "pos": (4, 5.5), "size": (2, 0.6), "color": "lightcyan"},
+        {"name": "Decoder\n(8 FFT Blocks)\n解码器(8层)", "pos": (7, 8), "size": (1.5, 1.2), "color": "lightcoral"},
+        {"name": "Mel Linear\n梅尔线性层", "pos": (7, 6.5), "size": (1.5, 0.8), "color": "lightgreen"},
+        {"name": "Mel Output\n[Batch, Mel, 80]\n梅尔输出", "pos": (7, 5.5), "size": (1.5, 0.8), "color": "lightblue"},
+    ]
+    
+    # 绘制组件
+    for comp in components:
+        x, y = comp["pos"]
+        w, h = comp["size"]
+        
+        # 绘制矩形
+        rect = plt.Rectangle((x-w/2, y-h/2), w, h, 
+                            facecolor=comp["color"], 
+                            edgecolor='black', 
+                            linewidth=2,
+                            alpha=0.8)
+        ax.add_patch(rect)
+        
+        # 添加文本
+        ax.text(x, y, comp["name"], 
+               ha='center', va='center', 
+               fontsize=10, fontweight='bold',
+               bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+    
+    # 绘制箭头连接
+    arrows = [
+        ((1, 9.5), (1, 8.6)),      # Embedding -> Encoder
+        ((2.5, 8.6), (3, 8.6)),    # Encoder -> Variance Adaptor
+        ((4, 7.4), (4, 6.8)),      # Variance Adaptor -> Predictors
+        ((4, 5.8), (4, 5.2)),      # Predictors -> Length Regulator
+        ((6, 8.6), (6.5, 8.6)),    # Length Regulator -> Decoder
+        ((7, 7.4), (7, 6.9)),      # Decoder -> Mel Linear
+        ((7, 6.1), (7, 5.9)),      # Mel Linear -> Output
+    ]
+    
+    for start, end in arrows:
+        ax.annotate('', xy=end, xytext=start,
+                   arrowprops=dict(arrowstyle='->', lw=2, color='darkblue'))
+    
+    # 添加标题和说明（中英文双语）
+    ax.text(5, 11.5, 'FastSpeech2 Model Architecture\nFastSpeech2 模型架构图', 
+           ha='center', va='center', fontsize=16, fontweight='bold')
+    
+    # 添加说明文字（中英文双语）
+    ax.text(0.5, 3, 'Model Components Description / 模型组件说明:', fontsize=12, fontweight='bold')
+    ax.text(0.5, 2.5, '• Encoder: 8 FFT Blocks for text processing / 编码器: 8层FFT Block，处理文本特征', fontsize=9)
+    ax.text(0.5, 2.2, '• Variance Adaptor: Predict duration/pitch/energy / 方差适配器: 预测时长/音高/能量', fontsize=9)
+    ax.text(0.5, 1.9, '• Length Regulator: Phoneme to frame alignment / 长度调节器: 音素到帧的对齐', fontsize=9)
+    ax.text(0.5, 1.6, '• Decoder: 8 FFT Blocks for mel generation / 解码器: 8层FFT Block，生成梅尔频谱', fontsize=9)
+    ax.text(0.5, 1.3, '• Output: 80-dim mel spectrogram / 输出: 80维梅尔频谱图', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"模型架构图已保存到: {save_path}")
+    return True
+
+
+def create_hierarchy_diagram(save_path="model_hierarchy.png", model=None):
+    """创建模型层次结构图"""
+    print("正在生成模型层次结构图...")
+    
+    # 创建图形
+    fig, ax = plt.subplots(1, 1, figsize=(14, 10))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 14)
+    ax.axis('off')
+    
+    # 定义层次结构
+    hierarchy = [
+        {"name": "FastSpeech2 Model\nFastSpeech2 模型", "pos": (5, 13), "size": (3, 0.8), "color": "lightblue", "level": 0},
+        
+        # 输入层
+        {"name": "Input Layer\n输入层", "pos": (1, 11.5), "size": (1.5, 0.6), "color": "lightgreen", "level": 1},
+        {"name": "Text Embedding\n文本嵌入", "pos": (1, 10.5), "size": (1.5, 0.6), "color": "lightgreen", "level": 2},
+        {"name": "Positional Encoding\n位置编码", "pos": (1, 9.5), "size": (1.5, 0.6), "color": "lightgreen", "level": 2},
+        
+        # 编码器
+        {"name": "Encoder\n编码器", "pos": (3, 11.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 1},
+        {"name": "FFT Block 1\nFFT块1", "pos": (3, 10.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 2},
+        {"name": "FFT Block 2-8\nFFT块2-8", "pos": (3, 9.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 2},
+        
+        # 方差适配器
+        {"name": "Variance Adaptor\n方差适配器", "pos": (5, 11.5), "size": (1.5, 0.6), "color": "lightyellow", "level": 1},
+        {"name": "Duration Predictor\n时长预测器", "pos": (4.5, 10.5), "size": (1.2, 0.6), "color": "lightpink", "level": 2},
+        {"name": "Pitch Predictor\n音高预测器", "pos": (5.5, 10.5), "size": (1.2, 0.6), "color": "lightpink", "level": 2},
+        {"name": "Energy Predictor\n能量预测器", "pos": (6.5, 10.5), "size": (1.2, 0.6), "color": "lightpink", "level": 2},
+        {"name": "Length Regulator\n长度调节器", "pos": (5, 9.5), "size": (1.5, 0.6), "color": "lightcyan", "level": 2},
+        
+        # 解码器
+        {"name": "Decoder\n解码器", "pos": (7, 11.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 1},
+        {"name": "FFT Block 1\nFFT块1", "pos": (7, 10.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 2},
+        {"name": "FFT Block 2-8\nFFT块2-8", "pos": (7, 9.5), "size": (1.5, 0.6), "color": "lightcoral", "level": 2},
+        
+        # 输出层
+        {"name": "Output Layer\n输出层", "pos": (9, 11.5), "size": (1.5, 0.6), "color": "lightgreen", "level": 1},
+        {"name": "Mel Linear\n梅尔线性层", "pos": (9, 10.5), "size": (1.5, 0.6), "color": "lightgreen", "level": 2},
+        {"name": "Mel Spectrogram\n梅尔频谱图", "pos": (9, 9.5), "size": (1.5, 0.6), "color": "lightblue", "level": 2},
+    ]
+    
+    # 绘制组件
+    for comp in hierarchy:
+        x, y = comp["pos"]
+        w, h = comp["size"]
+        level = comp["level"]
+        
+        # 根据层次设置不同的样式
+        if level == 0:
+            # 主模型
+            rect = plt.Rectangle((x-w/2, y-h/2), w, h, 
+                                facecolor=comp["color"], 
+                                edgecolor='darkblue', 
+                                linewidth=3,
+                                alpha=0.9)
+        elif level == 1:
+            # 主要组件
+            rect = plt.Rectangle((x-w/2, y-h/2), w, h, 
+                                facecolor=comp["color"], 
+                                edgecolor='black', 
+                                linewidth=2,
+                                alpha=0.8)
+        else:
+            # 子组件
+            rect = plt.Rectangle((x-w/2, y-h/2), w, h, 
+                                facecolor=comp["color"], 
+                                edgecolor='gray', 
+                                linewidth=1,
+                                alpha=0.7)
+        
+        ax.add_patch(rect)
+        
+        # 添加文本
+        fontsize = 10 if level == 0 else (9 if level == 1 else 8)
+        ax.text(x, y, comp["name"], 
+               ha='center', va='center', 
+               fontsize=fontsize, fontweight='bold' if level <= 1 else 'normal',
+               bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
+    
+    # 绘制连接线
+    connections = [
+        # 主模型到各组件
+        ((5, 12.6), (1, 11.8)),   # 到输入层
+        ((5, 12.6), (3, 11.8)),   # 到编码器
+        ((5, 12.6), (5, 11.8)),   # 到方差适配器
+        ((5, 12.6), (7, 11.8)),   # 到解码器
+        ((5, 12.6), (9, 11.8)),   # 到输出层
+        
+        # 编码器到方差适配器
+        ((3.75, 11.2), (4.25, 11.2)),
+        
+        # 方差适配器到解码器
+        ((5.75, 11.2), (6.25, 11.2)),
+        
+        # 解码器到输出层
+        ((7.75, 11.2), (8.25, 11.2)),
+    ]
+    
+    for start, end in connections:
+        ax.annotate('', xy=end, xytext=start,
+                   arrowprops=dict(arrowstyle='->', lw=2, color='darkblue', alpha=0.7))
+    
+    # 添加标题
+    ax.text(5, 13.5, 'FastSpeech2 Model Hierarchy\nFastSpeech2 模型层次结构', 
+           ha='center', va='center', fontsize=16, fontweight='bold')
+    
+    # 添加参数统计
+    if model is not None:
+        total_params = sum(p.numel() for p in model.parameters())
+        ax.text(0.5, 7, f'Model Statistics / 模型统计:\n\n'
+                        f'Total Parameters: {total_params:,}\n'
+                        f'Model Size: {total_params * 4 / 1024 / 1024:.1f} MB\n\n'
+                        f'总参数数量: {total_params:,}\n'
+                        f'模型大小: {total_params * 4 / 1024 / 1024:.1f} MB', 
+               fontsize=10, fontweight='bold',
+               bbox=dict(boxstyle="round,pad=0.5", facecolor='lightyellow', alpha=0.8))
+    
+    # 添加说明
+    ax.text(0.5, 3, 'Model Components / 模型组件:\n\n'
+                    '• Input: Text tokens → Embeddings\n'
+                    '• Encoder: 8 FFT Blocks for text processing\n'
+                    '• Variance Adaptor: Predict duration/pitch/energy\n'
+                    '• Decoder: 8 FFT Blocks for mel generation\n'
+                    '• Output: 80-dim mel spectrogram\n\n'
+                    '• 输入: 文本标记 → 嵌入向量\n'
+                    '• 编码器: 8层FFT块处理文本\n'
+                    '• 方差适配器: 预测时长/音高/能量\n'
+                    '• 解码器: 8层FFT块生成梅尔频谱\n'
+                    '• 输出: 80维梅尔频谱图', 
+           fontsize=9,
+           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgray', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"模型层次结构图已保存到: {save_path}")
+    return True
+
+
 # ============================================
 # 使用示例
 # ============================================
@@ -505,7 +877,9 @@ if __name__ == "__main__":
         n_layers=8,
         n_heads=2,
         d_ff=1024,
-        n_mel_channels=80
+        n_mel_channels=80,
+        max_seq_len=1000,
+        stats_path='./processed_data/stats.json'
     )
     
     # 测试数据
@@ -610,3 +984,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("测试完成！所有功能正常")
     print("=" * 70)
+    
+    # 打印模型结构
+    print_model_info(model)
+    
+    # 生成模型结构图
+    visualize_model_structure(model, "./model_structure")
