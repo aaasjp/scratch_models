@@ -28,7 +28,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/aaasjp/scratch_models.git
 cd stratch_models/train_model/audio/fastspeech2
 ```
 
