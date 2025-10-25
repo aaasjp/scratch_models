@@ -110,6 +110,10 @@ class FastSpeech2Loss(nn.Module):
         mel_target, duration_target, pitch_target, energy_target = normalize_targets(
             targets[0], targets[1], targets[2], targets[3], processed_dir='./processed_data'
         )
+        mel_target.requires_grad = False
+        duration_target.requires_grad = False
+        pitch_target.requires_grad = False
+        energy_target.requires_grad = False
         
         # 1. Mel Loss (MAE)
         mel_loss_unreduced = self.mae_loss(mel_pred, mel_target)
@@ -132,7 +136,7 @@ class FastSpeech2Loss(nn.Module):
         energy_loss = energy_loss_masked.sum() / (text_mask.sum() + 1e-6)
         
         # 总损失
-        total_loss = mel_loss + duration_loss + pitch_loss + energy_loss
+        total_loss = mel_loss + duration_loss + pitch_loss +  energy_loss
 
         
         return {
@@ -169,7 +173,8 @@ class Trainer:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5
+            patience=3,
+            min_lr=1e-6
         )
         
         # 记录
@@ -436,11 +441,11 @@ def main():
                         help='Dropout 率')
     
     # 训练参数
-    parser.add_argument('--num_epochs', type=int, default=20,
+    parser.add_argument('--num_epochs', type=int, default=100,
                         help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='批大小')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
+    parser.add_argument('--learning_rate', type=float, default=2e-4,
                         help='学习率')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='数据加载的工作进程数')

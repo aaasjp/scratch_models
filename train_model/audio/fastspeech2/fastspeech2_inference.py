@@ -219,10 +219,8 @@ class FastSpeech2Inference:
         mel_denorm = mel_denorm.T
         
         # 逆对数处理: 从对数域转换回线性域
-        # 原始处理: mel_db = librosa.power_to_db(mel, ref=np.max)
-        # 逆处理: mel_linear = librosa.db_to_power(mel_db, ref=np.max)
-        # 计算参考值（使用梅尔频谱的最大值）
-        # ref_value = np.max(mel_denorm)
+        # 原始处理: mel_db = librosa.power_to_db(mel, ref=1.0)
+        # 逆处理: mel_linear = librosa.db_to_power(mel_db, ref=1.0)
         mel_linear = librosa.db_to_power(mel_denorm, ref=1.0)
         print("--------------------------------")
         print(f"mel_linear.shape: {mel_linear.shape}")
@@ -385,7 +383,7 @@ class FastSpeech2Inference:
 def main():
     parser = argparse.ArgumentParser(description='FastSpeech2 Inference (Improved)')
     
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_50.pth')
     parser.add_argument('--phonemes_file', type=str, default='./output_phonemes.txt')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--duration_control', type=float, default=1.0)

@@ -42,7 +42,7 @@ def setup_chinese_font():
         print("建议安装中文字体或使用英文标签")
 
 # 初始化中文字体
-setup_chinese_font()
+# setup_chinese_font()
 
 
 def get_mask_from_lengths(lengths, max_len=None):
@@ -291,22 +291,22 @@ class VarianceAdaptor(nn.Module):
                     stats = json.load(f)
                 
                 # 加载pitch统计值
-                self.register_buffer('pitch_min', torch.tensor(stats.get('pitch_min', 0.0)))
-                self.register_buffer('pitch_max', torch.tensor(stats.get('pitch_max', 800.0)))
-                self.register_buffer('pitch_mean', torch.tensor(stats.get('pitch_mean', 0.0)))
-                self.register_buffer('pitch_std', torch.tensor(stats.get('pitch_std', 1.0)))
+                self.register_buffer('pitch_min', torch.tensor(stats.get('pitch_min')))
+                self.register_buffer('pitch_max', torch.tensor(stats.get('pitch_max')))
+                self.register_buffer('pitch_mean', torch.tensor(stats.get('pitch_mean')))
+                self.register_buffer('pitch_std', torch.tensor(stats.get('pitch_std')))
                 
                 # 加载energy统计值
-                self.register_buffer('energy_min', torch.tensor(stats.get('energy_min', 0.0)))
-                self.register_buffer('energy_max', torch.tensor(stats.get('energy_max', 100.0)))
-                self.register_buffer('energy_mean', torch.tensor(stats.get('energy_mean', 0.0)))
-                self.register_buffer('energy_std', torch.tensor(stats.get('energy_std', 1.0)))
+                self.register_buffer('energy_min', torch.tensor(stats.get('energy_min')))
+                self.register_buffer('energy_max', torch.tensor(stats.get('energy_max')))
+                self.register_buffer('energy_mean', torch.tensor(stats.get('energy_mean')))
+                self.register_buffer('energy_std', torch.tensor(stats.get('energy_std')))
                 
                 # 加载duration统计值
-                self.register_buffer('duration_min', torch.tensor(stats.get('duration_min', 1.0)))
-                self.register_buffer('duration_max', torch.tensor(stats.get('duration_max', 100.0)))
-                self.register_buffer('duration_mean', torch.tensor(stats.get('duration_mean', 8.0)))
-                self.register_buffer('duration_std', torch.tensor(stats.get('duration_std', 5.0)))
+                self.register_buffer('duration_min', torch.tensor(stats.get('duration_min')))
+                self.register_buffer('duration_max', torch.tensor(stats.get('duration_max')))
+                self.register_buffer('duration_mean', torch.tensor(stats.get('duration_mean')))
+                self.register_buffer('duration_std', torch.tensor(stats.get('duration_std')))
                 
                 print(f"成功从 {stats_path} 加载统计值")
                 

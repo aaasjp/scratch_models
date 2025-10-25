@@ -84,7 +84,8 @@ class AudioProcessor:
                  win_length=1024,
                  n_mels=80,
                  fmin=0,
-                 fmax=8000):
+                 fmax=8000,
+                 eps=1e-6):
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
@@ -92,7 +93,8 @@ class AudioProcessor:
         self.n_mels = n_mels
         self.fmin = fmin
         self.fmax = fmax
-        
+        self.eps = eps
+
     def get_mel_spectrogram(self, audio):
         """提取梅尔频谱"""
         # 确保音频是float32
@@ -146,7 +148,7 @@ class AudioProcessor:
         # YIN 不返回 NaN，但会返回超出 [fmin, fmax] 的值表示无效，所以将不可靠的 F0 设为 0.0
         f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
         # 对f0加1后取log，避免log(0)的问题
-        f0 = 10 * np.log2(f0 + 1.0)
+        f0 = 10 * np.log2(f0 + 1)
         
         return f0
     '''
@@ -177,7 +179,7 @@ class AudioProcessor:
         energy = np.sum(np.abs(stft) ** 2, axis=0)
         
         # 对energy加1后取log，避免log(0)的问题
-        energy = 10 * np.log2(energy + 1.0)
+        energy = 10 * np.log2(energy + 1)
         
         return energy
 
@@ -296,7 +298,7 @@ class LJSpeechDataset(Dataset):
                 print(f"  词表大小: {len(self.tokenizer)}")
                 
                 # 计算统计信息
-                pitch_values = [p for p in pitch_values if p > 0]  # 只考虑有声部分
+                #pitch_values = [p for p in pitch_values if p > 0]  # 只考虑有声部分
                 self.stats = {
                     'pitch_min': float(np.min(pitch_values)),
                     'pitch_max': float(np.max(pitch_values)),
