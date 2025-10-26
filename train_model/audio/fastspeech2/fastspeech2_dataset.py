@@ -146,7 +146,7 @@ class AudioProcessor:
             raise Exception(f"失败：YIN pitch extraction failed: {e}") from e
 
         # YIN 不返回 NaN，但会返回超出 [fmin, fmax] 的值表示无效，所以将不可靠的 F0 设为 0.0
-        f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
+        # f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
         # 对f0加1后取log，避免log(0)的问题
         f0 = 10 * np.log2(f0 + 1)
         
@@ -361,6 +361,7 @@ class LJSpeechDataset(Dataset):
     def _read_textgrid_durations(self, textgrid_path: str) -> Optional[np.ndarray]:
         """
         从TextGrid文件读取MFA对齐结果，返回每个音素的duration（帧数）
+        包含空音素（静音段）
         
         Args:
             textgrid_path: TextGrid文件路径
@@ -383,14 +384,13 @@ class LJSpeechDataset(Dataset):
                 print(f"警告: 未找到phones层 in {textgrid_path}")
                 return None
             
-            # 计算每个音素的duration（帧数）
+            # 计算每个音素的duration（帧数），包含空音素
             durations = []
             for interval in phoneme_tier:
-                if interval.mark.strip():  # 跳过空音素
-                    # 将时间转换为帧数
-                    duration_frames = int(interval.maxTime * self.audio_processor.sample_rate / self.audio_processor.hop_length) - \
-                                   int(interval.minTime * self.audio_processor.sample_rate / self.audio_processor.hop_length)
-                    durations.append(max(1, duration_frames))  # 确保至少1帧
+                # 将时间转换为帧数
+                duration_frames = int(interval.maxTime * self.audio_processor.sample_rate / self.audio_processor.hop_length) - \
+                               int(interval.minTime * self.audio_processor.sample_rate / self.audio_processor.hop_length)
+                durations.append(max(1, duration_frames))  # 确保至少1帧
             
             return np.array(durations, dtype=np.float32)
             
@@ -409,13 +409,13 @@ class LJSpeechDataset(Dataset):
     
     def _extract_phonemes_from_textgrid(self, textgrid_path: str) -> List[str]:
         """
-        从TextGrid文件中提取音素序列
+        从TextGrid文件中提取音素序列，包含空音素（静音段）
         
         Args:
             textgrid_path: TextGrid文件路径
             
         Returns:
-            phonemes: 音素列表
+            phonemes: 音素列表，空音素用特殊标记表示
         """
         try:
             import textgrid
@@ -432,11 +432,13 @@ class LJSpeechDataset(Dataset):
                 print(f"警告: 未找到phones层 in {textgrid_path}")
                 return []
             
-            # 提取音素
+            # 提取音素，包含空音素
             phonemes = []
             for interval in phoneme_tier:
-                if interval.mark.strip():  # 跳过空音素
+                if interval.mark.strip():  # 有内容的音素
                     phonemes.append(interval.mark.strip())
+                else:  # 空音素（静音段）
+                    phonemes.append('sil')  # 用特殊标记表示静音
             
             return phonemes
             
@@ -464,11 +466,11 @@ class LJSpeechDataset(Dataset):
         
         # 调整durations以确保总和等于mel_len
         total_duration = durations.sum()
-        #print('=' * 70)
         #print(f'durations: {durations}')
-        #print(f'total_duration: {total_duration}')
+        #print(f'durations.sum(): {durations.sum()}')
         #print(f'mel_len: {mel_len}')
-        #print('=' * 70)
+        if mel_len < durations.sum():
+            raise Exception(f"失败：mel_len < durations.sum()")
         if total_duration > 0 and total_duration != mel_len:
             scale_factor = mel_len / total_duration
             durations = durations * scale_factor
@@ -547,23 +549,25 @@ class LJSpeechDataset(Dataset):
                 p_segment = pitch[start:end]
                 e_segment = energy[start:end]
                 
+                '''
                 # Pitch: 只对有声部分求平均
                 voiced_pitch = p_segment[p_segment > 0]
                 if len(voiced_pitch) > 0:
                     phoneme_pitch.append(np.mean(voiced_pitch))
                 else:
                     phoneme_pitch.append(0.0)
-                
+                '''
+                # Pitch: 直接求平均
+                phoneme_pitch.append(np.mean(p_segment))
                 # Energy: 直接求平均
                 phoneme_energy.append(np.mean(e_segment))
             else:
-                phoneme_pitch.append(0.0)
-                phoneme_energy.append(0.0)
+                phoneme_pitch.append(0.0) ## 静音段
+                phoneme_energy.append(0.0) ## 静音段
             
             start = end
         
-        return np.array(phoneme_pitch), np.array(phoneme_energy)
-    
+        return np.array(phoneme_pitch), np.array(phoneme_energy) ## 包含静音段
     def _preprocess_sample(self, idx):
         """预处理单个样本"""
         file_info = self.file_list[idx]
@@ -579,7 +583,7 @@ class LJSpeechDataset(Dataset):
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.audio_processor.sample_rate)
         
         # 不需要归一化音频，因为librosa.load已经归一化了
-        # audio = audio / (np.max(np.abs(audio)) + 1e-6)
+        # audio = audio / (np.max(np.abs(audio)) + 1e-6) ## 峰值归一化
         
         # 读取文本
         text = self._read_lab_text(lab_path)
@@ -598,16 +602,31 @@ class LJSpeechDataset(Dataset):
         mel = self.audio_processor.get_mel_spectrogram(audio)
         pitch = self.audio_processor.get_pitch(audio)
         energy = self.audio_processor.get_energy(audio)
-        
+
+        print("--------------------------------")
+        print(f"idx: {idx}")
+        print(f"mel.shape: {mel.shape}")
+        print(f"pitch.shape: {pitch.shape}")
+        print(f"energy.shape: {energy.shape}")
         # 确保长度一致
         assert mel.shape[0] == len(pitch) == len(energy), "失败：mel, pitch, energy长度不一致"
-        min_len = min(mel.shape[0], len(pitch), len(energy))
-        mel = mel[:min_len]
-        pitch = pitch[:min_len]
-        energy = energy[:min_len]
+        #min_len = min(mel.shape[0], len(pitch), len(energy))
+        #mel = mel[:min_len]
+        #pitch = pitch[:min_len]
+        #energy = energy[:min_len]
         
         # 从TextGrid文件读取duration
-        durations = self._estimate_duration(phonemes, mel.shape[0], textgrid_path)
+        #durations = self._estimate_duration(phonemes, mel.shape[0], textgrid_path)
+        durations=self._read_textgrid_durations(textgrid_path)
+        print(f"durations: {durations}")
+        print(f"durations.shape: {durations.shape}")
+        print(f"durations.sum(): {durations.sum()}")
+        print("--------------------------------")
+
+        mel=mel[:int(durations.sum())]
+        pitch=pitch[:int(durations.sum())]
+        energy=energy[:int(durations.sum())]
+        print("--------------------------------")
         
         # 转换为音素级的 pitch 和 energy
         phoneme_pitch, phoneme_energy = self._phoneme_level_pitch_energy(

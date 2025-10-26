@@ -24,15 +24,14 @@ def test_dataset_samples():
             corpus_dir='./corpus',
             aligned_dir='./corpus_aligned',
             processed_dir='./processed_data',
-            max_samples=15000,  # 测试15000个样本
+            max_samples=2,  # 测试15000个样本
             force_preprocess=False
         )
         print("====================训练集样本详情============================")
         print(f"训练集样本数量: {len(train_dataset)}")
         if len(train_dataset) > 0:
             print("\n训练集样本详情:")
-            #for i in range(min(3, len(train_dataset))):
-            for i in range(len(train_dataset)):
+            for i in range(min(2, len(train_dataset))):
                 print("=" * 70)
                 sample = train_dataset[i]
                 print(f"\n样本 {i+1}:")
@@ -61,15 +60,14 @@ def test_dataset_samples():
             corpus_dir='./corpus',
             aligned_dir='./corpus_aligned',
             processed_dir='./processed_data',
-            max_samples=15000,  # 测试15000个样本
+            max_samples=2,  # 测试15000个样本
             force_preprocess=False
         )
         print("====================验证集样本详情============================")
         print(f"验证集样本数量: {len(valid_dataset)}")
         if len(valid_dataset) > 0:
             print("\n验证集样本详情:")
-            #for i in range(min(3, len(valid_dataset))):
-            for i in range(len(valid_dataset)):
+            for i in range(min(2, len(valid_dataset))):
                 print("=" * 70)
                 sample = valid_dataset[i]
                 print(f"\n样本 {i+1}:")

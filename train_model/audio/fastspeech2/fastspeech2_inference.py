@@ -15,10 +15,10 @@ from phonemizer import phonemize
 import librosa
 from scipy.io import wavfile
 import subprocess
-
+from typing import List
 from fastspeech2 import FastSpeech2
 from fastspeech2_dataset import PhonemeTokenizer
-
+from fastspeech2_dataset import LJSpeechDataset
 
 class HiFiGANVocoder:
     """HiFi-GAN 声码器(使用预训练模型)"""
@@ -88,10 +88,18 @@ class HiFiGANVocoder:
             return np.array([])
         
         try:
-            # 转换梅尔频谱格式 (参考test_convert_mel_to_wav.py)
-            mel_magnitude = np.sqrt(mel_spectrogram + 1e-9)  # 对应torch中的sqrt操作
+            # 确保梅尔频谱格式正确
+            if mel_spectrogram.ndim != 2:
+                raise ValueError(f"梅尔频谱维度错误: {mel_spectrogram.ndim}, 期望2维")
             
-            # 使用torch风格的对数压缩
+            # 添加数值稳定性处理
+            mel_spectrogram = np.clip(mel_spectrogram, 1e-8, None)
+            
+            # 使用与HiFi-GAN训练时相同的预处理方式
+            # 参考meldataset.py中的mel_spectrogram函数
+            mel_magnitude = np.sqrt(mel_spectrogram)
+            
+            # 动态范围压缩 (与训练时保持一致)
             C = 1
             clip_val = 1e-5
             mel_compressed = np.log(np.clip(mel_magnitude, a_min=clip_val, a_max=None) * C)
@@ -100,18 +108,31 @@ class HiFiGANVocoder:
             x = torch.FloatTensor(mel_compressed).to(self.device)
             x = x.unsqueeze(0)  # [1, n_mels, T]
             
+            print(f"HiFi-GAN输入形状: {x.shape}")
+            print(f"HiFi-GAN输入范围: [{x.min():.4f}, {x.max():.4f}]")
+            
             with torch.no_grad():
                 # 生成音频
                 y_g_hat = self.generator(x)
                 audio = y_g_hat.squeeze()  # 移除batch维度
                 
-                # 转换为numpy数组并归一化到[-1, 1]范围
+                # 转换为numpy数组
                 audio = audio.cpu().numpy()
+                
+                # 归一化到[-1, 1]范围，避免截断
+                audio_max = np.abs(audio).max()
+                if audio_max > 0:
+                    audio = audio / audio_max
+                
+                print(f"生成音频长度: {len(audio)}")
+                print(f"生成音频范围: [{audio.min():.4f}, {audio.max():.4f}]")
                 
             return audio
             
         except Exception as e:
             print(f"✗ 音频生成失败: {e}")
+            import traceback
+            traceback.print_exc()
             return np.array([]) 
     
 
@@ -119,9 +140,10 @@ class HiFiGANVocoder:
 
 class FastSpeech2Inference:
     """FastSpeech2 推理器(改进版)"""
-    def __init__(self, checkpoint_path, device='cuda', use_hifigan=True, phonemes_file=None):
+    def __init__(self, checkpoint_path, device='cuda', use_hifigan=True, phonemes_file=None, textgrid_file=None):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.phonemes_file = phonemes_file
+        self.textgrid_file = textgrid_file
         print(f"使用设备: {self.device}")
         
         # 加载检查点
@@ -208,23 +230,32 @@ class FastSpeech2Inference:
         # 逆标准化: x = (x_norm * std) + mean
         mel_denorm = mel_spectrogram * (self.stats['mel_std'] + eps) + self.stats['mel_mean']
         
-        # 逆裁剪: 确保在原始范围内
-        mel_denorm = np.clip(mel_denorm, self.stats['mel_min'], self.stats['mel_max'])
+        # 逆裁剪: 确保在原始范围内，但使用更温和的裁剪
+        mel_denorm = np.clip(mel_denorm, 
+                           self.stats['mel_min'] * 0.9,  # 稍微放宽下限
+                           self.stats['mel_max'] * 0.9)  # 稍微放宽上限
         
         print("--------------------------------")
         print(f"mel_denorm.shape: {mel_denorm.shape}")
-        print(f"mel_denorm: {mel_denorm}")
+        print(f"mel_denorm range: [{mel_denorm.min():.4f}, {mel_denorm.max():.4f}]")
         print("--------------------------------")
+        
         # 先转换shape: [T, n_mels] -> [n_mels, T]
         mel_denorm = mel_denorm.T
         
         # 逆对数处理: 从对数域转换回线性域
         # 原始处理: mel_db = librosa.power_to_db(mel, ref=1.0)
         # 逆处理: mel_linear = librosa.db_to_power(mel_db, ref=1.0)
+        # 添加数值稳定性处理
+        mel_denorm = np.clip(mel_denorm, -80, 20)  # 限制对数域范围
         mel_linear = librosa.db_to_power(mel_denorm, ref=1.0)
+        
+        # 添加平滑处理减少噪声
+        mel_linear = np.clip(mel_linear, 1e-8, None)  # 避免零值
+        
         print("--------------------------------")
         print(f"mel_linear.shape: {mel_linear.shape}")
-        print(f"mel_linear: {mel_linear}")
+        print(f"mel_linear range: [{mel_linear.min():.6f}, {mel_linear.max():.6f}]")
         print("--------------------------------")
         return mel_linear
     
@@ -273,6 +304,45 @@ class FastSpeech2Inference:
             print(f"加载音素文件失败: {e}")
             return []
     
+    def extract_phonemes_from_textgrid(self, textgrid_path: str) -> List[str]:
+        """
+        从TextGrid文件中提取音素序列，包含空音素（静音段）
+        
+        Args:
+            textgrid_path: TextGrid文件路径
+            
+        Returns:
+            phonemes: 音素列表，空音素用特殊标记表示
+        """
+        try:
+            import textgrid
+            tg = textgrid.TextGrid.fromFile(textgrid_path)
+            
+            # 查找phones层
+            phoneme_tier = None
+            for tier in tg.tiers:
+                if tier.name == 'phones':
+                    phoneme_tier = tier
+                    break
+            
+            if phoneme_tier is None:
+                print(f"警告: 未找到phones层 in {textgrid_path}")
+                return []
+            
+            # 提取音素，包含空音素
+            phonemes = []
+            for interval in phoneme_tier:
+                if interval.mark.strip():  # 有内容的音素
+                    phonemes.append(interval.mark.strip())
+                else:  # 空音素（静音段）
+                    phonemes.append('sil')  # 用特殊标记表示静音
+            
+            return phonemes
+            
+        except Exception as e:
+            print(f"从TextGrid提取音素失败 {textgrid_path}: {e}")
+            return []
+    
     @torch.no_grad()
     def synthesize(self, text=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0):
         """
@@ -288,8 +358,10 @@ class FastSpeech2Inference:
         
         # 获取音素
         if self.phonemes_file and os.path.exists(self.phonemes_file):
-            print(f"从音素文件合成: {self.phonemes_file}")
-            phonemes = self.load_phonemes_from_file(self.phonemes_file)
+            #print(f"从音素文件合成: {self.phonemes_file}")
+            #phonemes = self.load_phonemes_from_file(self.phonemes_file)
+            print(f"从TextGrid文件合成: {self.textgrid_file}")
+            phonemes = self.extract_phonemes_from_textgrid(self.textgrid_file)
             if len(phonemes) == 0:
                 raise ValueError("无法从音素文件加载音素")
         else:
@@ -370,21 +442,67 @@ class FastSpeech2Inference:
             audio: 音频数据
             output_path: 输出路径
         """
+        # 音频后处理，减少电流声
+        audio_processed = self.post_process_audio(audio)
+        
+        # 确保音频在合理范围内
+        audio_processed = np.clip(audio_processed, -1.0, 1.0)
+        
         # 按照HiFi-GAN的方式保存音频
-        # 音频乘以MAX_WAV_VALUE并转换为int16
-        audio_int16 = (audio * 32767).astype(np.int16)
+        # 使用更保守的缩放因子避免截断
+        max_val = 32767 * 0.95  # 留5%余量
+        audio_int16 = (audio_processed * max_val).astype(np.int16)
         
         # 保存为WAV文件
         wavfile.write(output_path, 22050, audio_int16)
         print(f"✓ 音频已保存到: {output_path}")
+        print(f"  音频长度: {len(audio_processed)} 采样点")
+        print(f"  音频范围: [{audio_processed.min():.4f}, {audio_processed.max():.4f}]")
+    
+    def post_process_audio(self, audio):
+        """
+        音频后处理，减少电流声和噪声
+        
+        Args:
+            audio: 原始音频数据
+            
+        Returns:
+            processed_audio: 处理后的音频数据
+        """
+        # 1. 简单的低通滤波减少高频噪声
+        from scipy import signal
+        
+        # 设计低通滤波器 (截止频率8kHz)
+        nyquist = 22050 / 2
+        cutoff = 8000 / nyquist
+        b, a = signal.butter(4, cutoff, btype='low')
+        
+        # 应用滤波器
+        audio_filtered = signal.filtfilt(b, a, audio)
+        
+        # 2. 平滑处理减少突变
+        # 使用简单的移动平均
+        window_size = 3
+        if len(audio_filtered) > window_size:
+            audio_smoothed = np.convolve(audio_filtered, np.ones(window_size)/window_size, mode='same')
+        else:
+            audio_smoothed = audio_filtered
+        
+        # 3. 归一化到[-1, 1]范围
+        audio_max = np.abs(audio_smoothed).max()
+        if audio_max > 0:
+            audio_smoothed = audio_smoothed / audio_max * 0.95  # 留5%余量
+        
+        return audio_smoothed
     
 
 
 def main():
     parser = argparse.ArgumentParser(description='FastSpeech2 Inference (Improved)')
     
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_50.pth')
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_70.pth')
     parser.add_argument('--phonemes_file', type=str, default='./output_phonemes.txt')
+    parser.add_argument('--textgrid_file', type=str, default='./corpus_aligned/audio_000017.TextGrid')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--duration_control', type=float, default=1.0)
     parser.add_argument('--pitch_control', type=float, default=1.0)
@@ -400,12 +518,13 @@ def main():
     print("FastSpeech2 改进版推理系统")
     print("="*70)
     
-    inferencer = FastSpeech2Inference(args.checkpoint, device=args.device, phonemes_file=args.phonemes_file)
+    inferencer = FastSpeech2Inference(args.checkpoint, device=args.device, phonemes_file=args.phonemes_file, textgrid_file=args.textgrid_file)
     
     # 处理输入
     if args.phonemes_file and os.path.exists(args.phonemes_file):
         # 使用音素文件
-        print(f"使用音素文件: {args.phonemes_file}")
+        #print(f"使用音素文件: {args.phonemes_file}")
+        print(f"使用TextGrid文件: {args.textgrid_file}")
         try:
             audio, mel, info = inferencer.synthesize(
                 duration_control=args.duration_control,
