@@ -88,18 +88,10 @@ class HiFiGANVocoder:
             return np.array([])
         
         try:
-            # 确保梅尔频谱格式正确
-            if mel_spectrogram.ndim != 2:
-                raise ValueError(f"梅尔频谱维度错误: {mel_spectrogram.ndim}, 期望2维")
+            # 转换梅尔频谱格式 (参考test_convert_mel_to_wav.py)
+            mel_magnitude = np.sqrt(mel_spectrogram + 1e-9)  # 对应torch中的sqrt操作
             
-            # 添加数值稳定性处理
-            mel_spectrogram = np.clip(mel_spectrogram, 1e-8, None)
-            
-            # 使用与HiFi-GAN训练时相同的预处理方式
-            # 参考meldataset.py中的mel_spectrogram函数
-            mel_magnitude = np.sqrt(mel_spectrogram)
-            
-            # 动态范围压缩 (与训练时保持一致)
+            # 使用torch风格的对数压缩
             C = 1
             clip_val = 1e-5
             mel_compressed = np.log(np.clip(mel_magnitude, a_min=clip_val, a_max=None) * C)
@@ -108,31 +100,18 @@ class HiFiGANVocoder:
             x = torch.FloatTensor(mel_compressed).to(self.device)
             x = x.unsqueeze(0)  # [1, n_mels, T]
             
-            print(f"HiFi-GAN输入形状: {x.shape}")
-            print(f"HiFi-GAN输入范围: [{x.min():.4f}, {x.max():.4f}]")
-            
             with torch.no_grad():
                 # 生成音频
                 y_g_hat = self.generator(x)
                 audio = y_g_hat.squeeze()  # 移除batch维度
                 
-                # 转换为numpy数组
+                # 转换为numpy数组并归一化到[-1, 1]范围
                 audio = audio.cpu().numpy()
-                
-                # 归一化到[-1, 1]范围，避免截断
-                audio_max = np.abs(audio).max()
-                if audio_max > 0:
-                    audio = audio / audio_max
-                
-                print(f"生成音频长度: {len(audio)}")
-                print(f"生成音频范围: [{audio.min():.4f}, {audio.max():.4f}]")
                 
             return audio
             
         except Exception as e:
             print(f"✗ 音频生成失败: {e}")
-            import traceback
-            traceback.print_exc()
             return np.array([]) 
     
 
@@ -230,32 +209,23 @@ class FastSpeech2Inference:
         # 逆标准化: x = (x_norm * std) + mean
         mel_denorm = mel_spectrogram * (self.stats['mel_std'] + eps) + self.stats['mel_mean']
         
-        # 逆裁剪: 确保在原始范围内，但使用更温和的裁剪
-        mel_denorm = np.clip(mel_denorm, 
-                           self.stats['mel_min'] * 0.9,  # 稍微放宽下限
-                           self.stats['mel_max'] * 0.9)  # 稍微放宽上限
+        # 逆裁剪: 确保在原始范围内
+        mel_denorm = np.clip(mel_denorm, self.stats['mel_min'], self.stats['mel_max'])
         
         print("--------------------------------")
         print(f"mel_denorm.shape: {mel_denorm.shape}")
-        print(f"mel_denorm range: [{mel_denorm.min():.4f}, {mel_denorm.max():.4f}]")
+        print(f"mel_denorm: {mel_denorm}")
         print("--------------------------------")
-        
         # 先转换shape: [T, n_mels] -> [n_mels, T]
         mel_denorm = mel_denorm.T
         
         # 逆对数处理: 从对数域转换回线性域
         # 原始处理: mel_db = librosa.power_to_db(mel, ref=1.0)
         # 逆处理: mel_linear = librosa.db_to_power(mel_db, ref=1.0)
-        # 添加数值稳定性处理
-        mel_denorm = np.clip(mel_denorm, -80, 20)  # 限制对数域范围
         mel_linear = librosa.db_to_power(mel_denorm, ref=1.0)
-        
-        # 添加平滑处理减少噪声
-        mel_linear = np.clip(mel_linear, 1e-8, None)  # 避免零值
-        
         print("--------------------------------")
         print(f"mel_linear.shape: {mel_linear.shape}")
-        print(f"mel_linear range: [{mel_linear.min():.6f}, {mel_linear.max():.6f}]")
+        print(f"mel_linear: {mel_linear}")
         print("--------------------------------")
         return mel_linear
     
@@ -442,58 +412,13 @@ class FastSpeech2Inference:
             audio: 音频数据
             output_path: 输出路径
         """
-        # 音频后处理，减少电流声
-        audio_processed = self.post_process_audio(audio)
-        
-        # 确保音频在合理范围内
-        audio_processed = np.clip(audio_processed, -1.0, 1.0)
-        
         # 按照HiFi-GAN的方式保存音频
-        # 使用更保守的缩放因子避免截断
-        max_val = 32767 * 0.95  # 留5%余量
-        audio_int16 = (audio_processed * max_val).astype(np.int16)
+        # 音频乘以MAX_WAV_VALUE并转换为int16
+        audio_int16 = (audio * 32767).astype(np.int16)
         
         # 保存为WAV文件
         wavfile.write(output_path, 22050, audio_int16)
         print(f"✓ 音频已保存到: {output_path}")
-        print(f"  音频长度: {len(audio_processed)} 采样点")
-        print(f"  音频范围: [{audio_processed.min():.4f}, {audio_processed.max():.4f}]")
-    
-    def post_process_audio(self, audio):
-        """
-        音频后处理，减少电流声和噪声
-        
-        Args:
-            audio: 原始音频数据
-            
-        Returns:
-            processed_audio: 处理后的音频数据
-        """
-        # 1. 简单的低通滤波减少高频噪声
-        from scipy import signal
-        
-        # 设计低通滤波器 (截止频率8kHz)
-        nyquist = 22050 / 2
-        cutoff = 8000 / nyquist
-        b, a = signal.butter(4, cutoff, btype='low')
-        
-        # 应用滤波器
-        audio_filtered = signal.filtfilt(b, a, audio)
-        
-        # 2. 平滑处理减少突变
-        # 使用简单的移动平均
-        window_size = 3
-        if len(audio_filtered) > window_size:
-            audio_smoothed = np.convolve(audio_filtered, np.ones(window_size)/window_size, mode='same')
-        else:
-            audio_smoothed = audio_filtered
-        
-        # 3. 归一化到[-1, 1]范围
-        audio_max = np.abs(audio_smoothed).max()
-        if audio_max > 0:
-            audio_smoothed = audio_smoothed / audio_max * 0.95  # 留5%余量
-        
-        return audio_smoothed
     
 
 
