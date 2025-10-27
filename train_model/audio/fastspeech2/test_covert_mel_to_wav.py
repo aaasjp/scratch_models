@@ -108,7 +108,7 @@ def convert_mel_to_wav(mel, device='cpu',output_dir='test_generated_files'):
         print(output_file)
 
 if __name__ == "__main__":
-    audio, sample_rate = librosa.load("test_files/audio_000001.wav", sr=None)
+    audio, sample_rate = librosa.load("test_files/audio_000002.wav", sr=None)
     mel = get_mel_spectrogram(audio, sample_rate, 1024, 256, 1024, 80, 0, 8000)
     print(f"mel shape: {mel.shape}")
     print(f"mel: {mel}")

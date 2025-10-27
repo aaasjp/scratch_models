@@ -362,6 +362,9 @@ class FastSpeech2Inference:
             pitch_control=pitch_control,
             energy_control=energy_control
         )
+        print(f"✓ 模型输出的梅尔频谱shape: {mel_output.shape}")
+        print(f"  模型输出的梅尔频谱帧数: {mel_lengths[0].item()}")
+        print(f"  模型输出的梅尔频谱时长: {mel_lengths[0].item() * 256 / 22050:.2f} 秒")
         
         # 获取有效长度的梅尔频谱
         mel_length = mel_lengths[0].item()
@@ -422,12 +425,22 @@ class FastSpeech2Inference:
     
 
 
+def extract_file_number(textgrid_path):
+    """从TextGrid文件路径中提取文件编号"""
+    import re
+    filename = os.path.basename(textgrid_path)
+    # 匹配 audio_XXXXXX.TextGrid 格式
+    match = re.search(r'audio_(\d+)\.TextGrid', filename)
+    if match:
+        return match.group(1)
+    return "unknown"
+
 def main():
     parser = argparse.ArgumentParser(description='FastSpeech2 Inference (Improved)')
     
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_70.pth')
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_40.pth')
     parser.add_argument('--phonemes_file', type=str, default='./output_phonemes.txt')
-    parser.add_argument('--textgrid_file', type=str, default='./corpus_aligned/audio_000017.TextGrid')
+    parser.add_argument('--textgrid_file', type=str, default='./corpus_aligned/audio_000065.TextGrid')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--duration_control', type=float, default=1.0)
     parser.add_argument('--pitch_control', type=float, default=1.0)
@@ -446,10 +459,15 @@ def main():
     inferencer = FastSpeech2Inference(args.checkpoint, device=args.device, phonemes_file=args.phonemes_file, textgrid_file=args.textgrid_file)
     
     # 处理输入
-    if args.phonemes_file and os.path.exists(args.phonemes_file):
+    if args.textgrid_file and os.path.exists(args.textgrid_file):
         # 使用音素文件
         #print(f"使用音素文件: {args.phonemes_file}")
         print(f"使用TextGrid文件: {args.textgrid_file}")
+        
+        # 提取文件编号
+        file_number = extract_file_number(args.textgrid_file)
+        print(f"提取的文件编号: {file_number}")
+        
         try:
             audio, mel, info = inferencer.synthesize(
                 duration_control=args.duration_control,
@@ -457,11 +475,12 @@ def main():
                 energy_control=args.energy_control
             )
             
-            audio_path = os.path.join(args.output_dir, 'output_from_phonemes.wav')
+            # 生成包含文件编号的输出文件名
+            audio_path = os.path.join(args.output_dir, f'output_audio_{file_number}.wav')
             inferencer.save_audio(audio, audio_path)
             
             # 保存信息
-            info_path = os.path.join(args.output_dir, 'info_phonemes.json')
+            info_path = os.path.join(args.output_dir, f'info_audio_{file_number}.json')
             with open(info_path, 'w', encoding='utf-8') as f:
                 json.dump(info, f, indent=2, ensure_ascii=False)
             

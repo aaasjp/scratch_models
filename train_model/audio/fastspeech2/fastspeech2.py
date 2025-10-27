@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 from torchviz import make_dot
 import tempfile
+import numpy as np
 
 # 设置中文字体支持
 def setup_chinese_font():
@@ -321,7 +322,6 @@ class VarianceAdaptor(nn.Module):
         
     def get_pitch_embedding(self, pitch, mask=None):
         """将连续pitch值转换为embedding"""
-        pitch = torch.clamp(pitch, self.pitch_min, self.pitch_max)
         pitch_bins = ((pitch - self.pitch_min) / (self.pitch_max - self.pitch_min) * (self.n_bins - 1)).long()
         pitch_emb = self.pitch_embedding(pitch_bins)
         
@@ -333,7 +333,6 @@ class VarianceAdaptor(nn.Module):
     
     def get_energy_embedding(self, energy, mask=None):
         """将连续energy值转换为embedding"""
-        energy = torch.clamp(energy, self.energy_min, self.energy_max)
         energy_bins = ((energy - self.energy_min) / (self.energy_max - self.energy_min) * (self.n_bins - 1)).long()
         energy_emb = self.energy_embedding(energy_bins)
         
@@ -341,6 +340,33 @@ class VarianceAdaptor(nn.Module):
             energy_emb = energy_emb.masked_fill(~mask.unsqueeze(-1), 0.0)
         
         return energy_emb
+    
+    def _denormalize_standard(self, x, min_value, max_value, mean_value, std_value, eps=1e-6):
+        """标准的逆归一化：对所有值进行逆归一化。"""
+        x = x * (float(std_value) + eps) + float(mean_value)
+        return torch.clamp(x, min=float(min_value), max=float(max_value))
+    
+    def _denormalize_voiced(self, x, min_value, max_value, mean_value, std_value, eps=1e-6):
+        """对x!=0的部分先做逆归一化，然后对于逆归一化后的数据，如果<pitch_min则设置为0，如果>pitch_max则设置为pitch_max。"""
+        result = x.clone()
+        # 创建非零部分的掩码
+        nonzero_mask = x != 0
+        if nonzero_mask.any():
+            # 只对非零部分进行逆归一化
+            nonzero_values = x[nonzero_mask]
+            nonzero_denormalized = nonzero_values * (float(std_value) + eps) + float(mean_value)
+            
+            # 对于逆归一化后的数据，如果<pitch_min则设置为0，如果>pitch_max则设置为pitch_max
+            result[nonzero_mask] = torch.where(
+                nonzero_denormalized < float(min_value),
+                torch.zeros_like(nonzero_denormalized),  # 设置为0
+                torch.where(
+                    nonzero_denormalized > float(max_value),
+                    torch.full_like(nonzero_denormalized, float(max_value)),  # 设置为pitch_max
+                    nonzero_denormalized  # 保持原值
+                )
+            )
+        return result
         
     def forward(self, x, text_mask=None, duration=None, pitch=None, energy=None, 
                 max_len=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0,eps=1e-6):
@@ -363,27 +389,28 @@ class VarianceAdaptor(nn.Module):
         
         # 训练时使用真实值，推理时使用预测值
         if duration is None:
-            # 归一化的逆运算，先进行log计算，再进行归一化
-            duration = duration_pred * (float(self.duration_std) + eps) + float(self.duration_mean)
+            # 归一化的逆运算
+            duration = self._denormalize_standard(duration_pred, self.duration_min, self.duration_max, 
+                                                self.duration_mean, self.duration_std, eps)
             # 应用duration_control控制
             duration = duration * duration_control
-            # 确保duration为正值且为整数
-            duration = torch.clamp(duration, min=float(self.duration_min), max=float(self.duration_max))
+            # 确保duration至少为1的整数
+            duration = torch.clamp(duration, min=1.0)
             duration = torch.round(duration)
         
         if pitch is None:
-            # 归一化的逆运算，先进行log计算，再进行归一化
-            pitch = pitch_pred * (float(self.pitch_std) + eps) + float(self.pitch_mean)
+            # 归一化的逆运算，只对>0的部分进行逆归一化
+            pitch = self._denormalize_voiced(pitch_pred, self.pitch_min, self.pitch_max, 
+                                           self.pitch_mean, self.pitch_std, eps)
             # 应用pitch_control控制
             pitch = pitch * pitch_control
-            pitch = torch.clamp(pitch, min=float(self.pitch_min), max=float(self.pitch_max))
         
         if energy is None:
-            # 归一化的逆运算，先进行log计算，再进行归一化
-            energy = energy_pred * (float(self.energy_std) + eps) + float(self.energy_mean)
+            # 归一化的逆运算，只对>0的部分进行逆归一化
+            energy = self._denormalize_voiced(energy_pred, self.energy_min, self.energy_max, 
+                                            self.energy_mean, self.energy_std, eps)
             # 应用energy_control控制
             energy = energy * energy_control
-            energy = torch.clamp(energy, min=float(self.energy_min), max=float(self.energy_max))
             
         # 添加 pitch 和 energy embedding
         pitch_emb = self.get_pitch_embedding(pitch, text_mask)
@@ -450,6 +477,7 @@ class FastSpeech2(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)  # [1, max_len, d_model]
+    
         
     def forward(self, text, text_lengths=None, duration=None, pitch=None, energy=None, 
                 max_mel_len=None, duration_control=1.0, pitch_control=1.0, energy_control=1.0):

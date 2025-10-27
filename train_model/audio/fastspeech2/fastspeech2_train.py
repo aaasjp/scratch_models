@@ -40,6 +40,25 @@ def clamp_and_standardize(x: torch.Tensor,
     return (x - float(mean_value)) / (float(std_value) + eps)
 
 
+def clamp_and_standardize_voiced(x: torch.Tensor,
+                                 min_value: float,
+                                 max_value: float,
+                                 mean_value: float,
+                                 std_value: float,
+                                 eps: float = 1e-6) -> torch.Tensor:
+    """只对>0的部分进行裁剪和标准化，0值保持不变。"""
+    result = x.clone()
+    # 创建有声部分的掩码
+    voiced_mask = x > 0
+    if voiced_mask.any():
+        # 只对有声部分进行裁剪和标准化
+        voiced_values = x[voiced_mask]
+        voiced_clamped = torch.clamp(voiced_values, min=float(min_value), max=float(max_value))
+        voiced_normalized = (voiced_clamped - float(mean_value)) / (float(std_value) + eps)
+        result[voiced_mask] = voiced_normalized
+    return result
+
+
 def normalize_targets(mel_target: torch.Tensor,
                       duration_target: torch.Tensor,
                       pitch_target: torch.Tensor,
@@ -75,10 +94,10 @@ def normalize_targets(mel_target: torch.Tensor,
     duration_norm = clamp_and_standardize(
         duration_target, stats['duration_min'], stats['duration_max'], stats['duration_mean'], stats['duration_std'], eps
     )
-    pitch_norm = clamp_and_standardize(
+    pitch_norm = clamp_and_standardize_voiced(
         pitch_target, stats['pitch_min'], stats['pitch_max'], stats['pitch_mean'], stats['pitch_std'], eps
     )
-    energy_norm = clamp_and_standardize(
+    energy_norm = clamp_and_standardize_voiced(
         energy_target, stats['energy_min'], stats['energy_max'], stats['energy_mean'], stats['energy_std'], eps
     )
 

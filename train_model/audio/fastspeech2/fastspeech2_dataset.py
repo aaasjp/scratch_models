@@ -119,69 +119,51 @@ class AudioProcessor:
         
         return mel_db.T  # [T, n_mels]
     
-    def get_pitch(self, audio: np.ndarray) -> np.ndarray:
-        """
-        使用 librosa.yin 提取基频 (F0)。
-        
-        Returns:
-            np.ndarray: F0 轨迹，未发声部分设为 0.0。
-        """
-        if audio.size == 0:
-            raise Exception("失败：Input audio is empty.")
+    
 
-        # 安全设置 fmin/fmax
+    def get_pitch(self, audio: np.ndarray) -> np.ndarray:
+        """提取基频，过滤静音帧无效值"""
+        if audio.size == 0:
+            raise Exception("Input audio is empty.")
+
         fmin = librosa.note_to_hz('C2')  # ~65.4 Hz
         fmax = librosa.note_to_hz('C7')  # ~2093 Hz
 
-        try:
-            f0 = librosa.yin(
-                y=audio,
-                fmin=fmin,
-                fmax=fmax,
-                sr=self.sample_rate,
-                frame_length=self.win_length,
-                hop_length=self.hop_length,
-            )
-        except Exception as e:
-            raise Exception(f"失败：YIN pitch extraction failed: {e}") from e
-
-        # YIN 不返回 NaN，但会返回超出 [fmin, fmax] 的值表示无效，所以将不可靠的 F0 设为 0.0
-        # f0 = np.where((f0 >= fmin) & (f0 <= fmax), f0, 0.0)
-        # 对f0加1后取log，避免log(0)的问题
-        f0 = 10 * np.log2(f0 + 1)
+        f0 = librosa.yin(
+            y=audio,
+            fmin=fmin,
+            fmax=fmax,
+            sr=self.sample_rate,
+            frame_length=self.win_length,
+            hop_length=self.hop_length,
+        )
         
+        # 过滤无效F0（超出范围或接近0的值设为0，表示静音）
+        f0[(f0 < fmin) | (f0 > fmax) | (f0 < 1e-3)] = 0.0
+        
+        # 仅对有声段进行log转换（避免静音帧的0值影响）
+        f0[f0 > 0] = np.log(f0[f0 > 0] + 1)
         return f0
-    '''
+
+
+
     def get_energy(self, audio):
-        """提取能量"""
-        # 使用RMS能量
+        """提取RMS能量，过滤静音段噪声"""
+        # 使用RMS计算能量，更贴近人耳对响度的感知
         energy = librosa.feature.rms(
             y=audio,
             frame_length=self.win_length,
             hop_length=self.hop_length
-        )[0]
+        )[0]  # [T]
         
+        # 计算能量阈值（例如：小于全局最大值的1%视为静音，能量设为0）
+        energy_threshold = np.max(energy) * 0.01 if np.max(energy) > 0 else 0
+        energy[energy < energy_threshold] = 0.0
+        
+        # 仅对有声段进行log转换（避免静音帧的0值影响）
+        energy[energy > 0] = np.log(energy[energy > 0] + 1)
         return energy
-    '''
 
-    def get_energy(self, audio):
-        """提取能量（使用平方和，确保与mel频谱长度一致）"""
-        # 使用STFT计算能量，确保与mel频谱长度一致
-        # 先计算STFT
-        stft = librosa.stft(
-            y=audio,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length
-        )
-        
-        # 计算每帧的平方和作为能量
-        energy = np.sum(np.abs(stft) ** 2, axis=0)
-        
-        # 对energy加1后取log，避免log(0)的问题
-        energy = 10 * np.log2(energy + 1)
-        
-        return energy
 
 class LJSpeechDataset(Dataset):
     """LJSpeech 数据集（从本地已对齐数据加载）"""
@@ -298,7 +280,8 @@ class LJSpeechDataset(Dataset):
                 print(f"  词表大小: {len(self.tokenizer)}")
                 
                 # 计算统计信息
-                #pitch_values = [p for p in pitch_values if p > 0]  # 只考虑有声部分
+                pitch_values = [p for p in pitch_values if p > 0]  # 只考虑有声部分
+                energy_values = [e for e in energy_values if e > 0]  # 只考虑有声部分
                 self.stats = {
                     'pitch_min': float(np.min(pitch_values)),
                     'pitch_max': float(np.max(pitch_values)),
@@ -447,127 +430,69 @@ class LJSpeechDataset(Dataset):
             return []
 
     
-    def _estimate_duration(self, phonemes, mel_len, textgrid_path):
+    def _phoneme_level_pitch_energy(self, pitch, energy, durations, phonemes):
         """
-        从TextGrid文件读取MFA对齐结果，计算每个音素的duration
-        """
-        n_phonemes = len(phonemes)
-        if n_phonemes == 0:
-            return np.array([])
-        
-        # 从TextGrid文件读取对齐结果
-        durations = self._read_textgrid_durations(textgrid_path)
-        if durations is None:
-            raise Exception("失败：无法从TextGrid文件读取对齐结果")
-        
-        if len(durations) != n_phonemes:
-            print(f"警告: TextGrid音素数量({len(durations)})与输入音素数量({n_phonemes})不匹配")
-            raise Exception(f"失败：TextGrid音素数量({len(durations)})与输入音素数量({n_phonemes})不匹配")
-        
-        # 调整durations以确保总和等于mel_len
-        total_duration = durations.sum()
-        #print(f'durations: {durations}')
-        #print(f'durations.sum(): {durations.sum()}')
-        #print(f'mel_len: {mel_len}')
-        if mel_len < durations.sum():
-            raise Exception(f"失败：mel_len < durations.sum()")
-        if total_duration > 0 and total_duration != mel_len:
-            scale_factor = mel_len / total_duration
-            durations = durations * scale_factor
-            # 严格保证durations.sum() == mel_len且durations都是>=1的正整数
-            durations = self.adjust_durations(durations, mel_len)
-            assert durations.sum() == mel_len, f"失败：durations.sum() != mel_len"
-        else:
-            raise Exception("失败：TextGrid对齐结果为空")
-        
-        return durations
-
-    def adjust_durations(self, durations, target):
-        n = len(durations)
-        min_possible = n  # 每个元素至少为1的最小总和
-        if target < min_possible:
-            raise ValueError("target必须大于等于数组长度（每个元素至少为1）")
-        
-        # 先确保每个元素至少为1
-        adjusted = [max(1, np.floor(d).astype(np.int32)) for d in durations]
-        current_sum = sum(adjusted)
-        difference = target - current_sum
-        
-        if difference == 0:
-            return np.array(adjusted, dtype=np.float32)
-        
-        # 情况1：需要增加总和（difference > 0）
-        if difference > 0:
-            i = 0
-            while difference > 0:
-                adjusted[i] += 1
-                difference -= 1
-                i = (i + 1) % n  # 循环分配额外值
-        
-        # 情况2：需要减少总和（difference < 0）
-        else:
-            # 需要减少的总量（转为正数）
-            reduce_total = -difference
-            i = 0
-            while reduce_total > 0:
-                # 每个元素最多只能减到1（不能小于1）
-                max_reduce = adjusted[i] - 1
-                if max_reduce <= 0:
-                    i = (i + 1) % n  # 跳过已无法再减少的元素
-                    continue
-                # 本次实际减少的量（取可减少的最大值或剩余需要减少的量）
-                reduce = min(max_reduce, reduce_total)
-                adjusted[i] -= reduce
-                reduce_total -= reduce
-                i = (i + 1) % n  # 循环处理下一个元素
-        
-        return np.array(adjusted, dtype=np.float32)
-    
-    def _phoneme_level_pitch_energy(self, pitch, energy, durations):
-        """
-        将帧级的 pitch 和 energy 转换为音素级（取平均）
+        将帧级的 pitch 和 energy 转换为音素级
+        使用phoneme标记来判断静音段
         
         Args:
             pitch: [T] 帧级 pitch
             energy: [T] 帧级 energy
             durations: [N] 每个音素的帧数
+            phonemes: [N] 音素列表
         
         Returns:
             phoneme_pitch: [N] 音素级 pitch
             phoneme_energy: [N] 音素级 energy
         """
+        # 定义静音音素标记
+        SILENCE_PHONES = {'sil', 'sp', 'spn', '', 'SIL', 'SP'}
+        
         phoneme_pitch = []
         phoneme_energy = []
         
+        # 计算全局最小能量作为静音参考
+        min_energy = np.percentile(energy[energy > 0], 5) if np.any(energy > 0) else 0.0
+        
         start = 0
-        for dur in durations:
+        for phoneme, dur in zip(phonemes, durations):
             end = start + int(dur)
             end = min(end, len(pitch))
             
             if start < end:
-                # 计算该音素对应帧的平均值
                 p_segment = pitch[start:end]
                 e_segment = energy[start:end]
                 
-                '''
-                # Pitch: 只对有声部分求平均
-                voiced_pitch = p_segment[p_segment > 0]
-                if len(voiced_pitch) > 0:
-                    phoneme_pitch.append(np.mean(voiced_pitch))
+                # 判断是否为静音
+                is_silence = phoneme in SILENCE_PHONES
+                
+                if is_silence:
+                    # 静音段：使用固定的低值
+                    phoneme_pitch.append(0.0)  # 或者 np.log(1.0)
+                    phoneme_energy.append(min_energy)
                 else:
-                    phoneme_pitch.append(0.0)
-                '''
-                # Pitch: 直接求平均
-                phoneme_pitch.append(np.mean(p_segment))
-                # Energy: 直接求平均
-                phoneme_energy.append(np.mean(e_segment))
+                    # 有声段
+                    # Pitch: 只对voiced部分求平均（pitch > 阈值的部分）
+                    pitch_threshold = np.log(50)  # 约50Hz的阈值
+                    voiced_mask = p_segment > pitch_threshold
+                    
+                    if np.any(voiced_mask):
+                        phoneme_pitch.append(np.mean(p_segment[voiced_mask]))
+                    else:
+                        # 清音（如 /s/, /f/）：使用0或很小的值
+                        phoneme_pitch.append(0.0)
+                    
+                    # Energy: 直接求平均
+                    phoneme_energy.append(np.mean(e_segment))
             else:
-                phoneme_pitch.append(0.0) ## 静音段
-                phoneme_energy.append(0.0) ## 静音段
+                # 异常情况
+                phoneme_pitch.append(0.0)
+                phoneme_energy.append(min_energy)
             
             start = end
         
-        return np.array(phoneme_pitch), np.array(phoneme_energy) ## 包含静音段
+        return np.array(phoneme_pitch), np.array(phoneme_energy)
+
     def _preprocess_sample(self, idx):
         """预处理单个样本"""
         file_info = self.file_list[idx]
@@ -630,7 +555,7 @@ class LJSpeechDataset(Dataset):
         
         # 转换为音素级的 pitch 和 energy
         phoneme_pitch, phoneme_energy = self._phoneme_level_pitch_energy(
-            pitch, energy, durations
+            pitch, energy, durations, phonemes
         )
         
         return {
