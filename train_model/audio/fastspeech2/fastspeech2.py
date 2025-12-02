@@ -346,26 +346,30 @@ class VarianceAdaptor(nn.Module):
         x = x * (float(std_value) + eps) + float(mean_value)
         return torch.clamp(x, min=float(min_value), max=float(max_value))
     
-    def _denormalize_voiced(self, x, min_value, max_value, mean_value, std_value, eps=1e-6):
-        """对x!=0的部分先做逆归一化，然后对于逆归一化后的数据，如果<pitch_min则设置为0，如果>pitch_max则设置为pitch_max。"""
+    def _denormalize_voiced(self, x, min_value, max_value, mean_value, std_value, eps=1e-6, threshold=1e-6):
+        """如果x的值在0附近，则设置为0，然后再对剩下的数据进行逆归一化，并且如果<min_value则设置为min_value，如果>max_value则设置为max_value。"""
         result = x.clone()
-        # 创建非零部分的掩码
-        nonzero_mask = x != 0
+        # 创建接近0的掩码（在threshold范围内的值）
+        near_zero_mask = torch.abs(x) <= threshold
+        
+        # 将接近0的值设置为0
+        result[near_zero_mask] = 0.0
+        
+        # 创建非零部分的掩码（排除已经设置为0的部分）
+        nonzero_mask = ~near_zero_mask
+        
         if nonzero_mask.any():
             # 只对非零部分进行逆归一化
             nonzero_values = x[nonzero_mask]
             nonzero_denormalized = nonzero_values * (float(std_value) + eps) + float(mean_value)
             
-            # 对于逆归一化后的数据，如果<pitch_min则设置为0，如果>pitch_max则设置为pitch_max
-            result[nonzero_mask] = torch.where(
-                nonzero_denormalized < float(min_value),
-                torch.zeros_like(nonzero_denormalized),  # 设置为0
-                torch.where(
-                    nonzero_denormalized > float(max_value),
-                    torch.full_like(nonzero_denormalized, float(max_value)),  # 设置为pitch_max
-                    nonzero_denormalized  # 保持原值
-                )
+            # 对逆归一化后的数据进行范围限制
+            result[nonzero_mask] = torch.clamp(
+                nonzero_denormalized, 
+                min=float(min_value), 
+                max=float(max_value)
             )
+        
         return result
         
     def forward(self, x, text_mask=None, duration=None, pitch=None, energy=None, 

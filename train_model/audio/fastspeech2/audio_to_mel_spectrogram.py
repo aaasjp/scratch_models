@@ -235,7 +235,7 @@ class AudioToMelSpectrogram:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='音频文件转mel频谱图工具')
-    parser.add_argument('audio_path', nargs='?', default='test_files/audio_000001.wav', help='输入音频文件路径（默认：test_files/audio_000001.wav）')
+    parser.add_argument('audio_path', nargs='?', default='test_files/audio_000115.wav', help='输入音频文件路径（默认：test_files/audio_000115.wav）')
     parser.add_argument('--output_dir', '-o', default='./mel_output', help='输出目录（默认：./mel_output）')
     parser.add_argument('--sample_rate', type=int, default=22050, help='采样率（默认22050）')
     parser.add_argument('--n_mels', type=int, default=80, help='Mel滤波器数量（默认80）')
@@ -281,6 +281,6 @@ if __name__ == "__main__":
         print("python audio_to_mel_spectrogram.py <音频文件路径> [选项]")
         print("\n示例:")
         print("python audio_to_mel_spectrogram.py test.wav")
-        print("python audio_to_mel_spectrogram.py test.wav --output_dir ./mel_output --n_mels 128")
+        print("python audio_to_mel_spectrogram.py test.wav --output_dir ./mel_output --n_mels 80")
     else:
         exit(main())

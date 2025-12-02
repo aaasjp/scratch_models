@@ -438,9 +438,9 @@ def extract_file_number(textgrid_path):
 def main():
     parser = argparse.ArgumentParser(description='FastSpeech2 Inference (Improved)')
     
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/checkpoint_epoch_40.pth')
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pth')
     parser.add_argument('--phonemes_file', type=str, default='./output_phonemes.txt')
-    parser.add_argument('--textgrid_file', type=str, default='./corpus_aligned/audio_000065.TextGrid')
+    parser.add_argument('--textgrid_file', type=str, default='./corpus_aligned/audio_000115.TextGrid')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--duration_control', type=float, default=1.0)
     parser.add_argument('--pitch_control', type=float, default=1.0)
